@@ -1,0 +1,8 @@
+data/
+data/
+src/train_logs/
+datasets/
+src/train_logs/
+*.pth
+*.pyc
+__pycache__/
