@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--patch_size", type=int, nargs=3, default=[96, 160, 160])
+    parser.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 128])
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save_dir", type=str, default="train_logs/lits_b2nd")
@@ -157,9 +157,17 @@ def main():
     in_channels = sample_imgs.shape[1]
     num_classes = 2
 
-    model = UNet3D(in_channels=in_channels, num_classes=num_classes, base_filters=32)
+    model = UNet3D(in_channels=in_channels, num_classes=num_classes, base_filters=32,dropout_p=0.0)
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",      
+    factor=0.9,      # 每次降低到 0.9 倍
+    patience=30,     # 连续 30 个 epoch 没有提升就降 lr
+    min_lr=1e-5,     # 不要小于 1e-5
+    # verbose=True,
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -253,12 +261,13 @@ def main():
 
             val_loss /= max(1, n_val)
             val_dice /= max(1, n_val)
-
+            # scheduler.step(val_dice)
             print(
                 f"[{args.stage}] Epoch {epoch:03d} | "
                 f"Train loss={train_loss:.4f}, dice={train_dice:.4f} | "
                 f"Val loss={val_loss:.4f}, dice={val_dice:.4f}"
             )
+            scheduler.step(val_dice)
 
             # === 写入 TensorBoard 标量 ===
             if writer is not None:
@@ -266,6 +275,7 @@ def main():
                 writer.add_scalar(f"{args.stage}/Loss/val",   val_loss,   epoch)
                 writer.add_scalar(f"{args.stage}/Dice/train", train_dice, epoch)
                 writer.add_scalar(f"{args.stage}/Dice/val",   val_dice,   epoch)
+                writer.add_scalar(f"{args.stage}/LR", optimizer.param_groups[0]["lr"], epoch)
 
             # 统一 checkpoint 字典
             ckpt_common = {

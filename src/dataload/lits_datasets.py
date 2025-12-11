@@ -1,7 +1,7 @@
-# datasets/lits_datasets.py
+# dataload/lits_datasets.py
 import random
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import blosc2
 import numpy as np
@@ -15,7 +15,10 @@ class LITSDatasetB2ND(Dataset):
 
     - stage="liver":  背景 vs 肝脏(含肿瘤)，标签: 0 / 1
     - stage="tumor":  背景/肝 vs 肿瘤，      标签: 0 / 1
-    - train_ratio: 简单按病例划分 train/val
+
+    肿瘤阶段 (stage="tumor")：
+        随机 patch 在『肝脏 ROI』内部采样，而不是整幅 volume 乱裁，
+        提高肿瘤样本比例，训练更稳定。
     """
 
     def __init__(
@@ -58,6 +61,7 @@ class LITSDatasetB2ND(Dataset):
     def __len__(self):
         return len(self.case_ids)
 
+    # -------------------- 读一个病例 -------------------- #
     def _load_case_np(self, case_id: str):
         """
         读取一个病例的 image / seg
@@ -92,6 +96,7 @@ class LITSDatasetB2ND(Dataset):
 
         return img, seg, properties
 
+    # -------------------- 全图随机裁剪 -------------------- #
     @staticmethod
     def _random_crop_with_padding(
         img: np.ndarray,
@@ -111,12 +116,16 @@ class LITSDatasetB2ND(Dataset):
         pad_x = max(0, px - X)
 
         if pad_z > 0 or pad_y > 0 or pad_x > 0:
-            img = np.pad(img,
-                         ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
-                         mode="constant")
-            seg = np.pad(seg,
-                         ((0, pad_z), (0, pad_y), (0, pad_x)),
-                         mode="constant")
+            img = np.pad(
+                img,
+                ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
+                mode="constant",
+            )
+            seg = np.pad(
+                seg,
+                ((0, pad_z), (0, pad_y), (0, pad_x)),
+                mode="constant",
+            )
             _, Z, Y, X = img.shape
 
         max_z = Z - pz
@@ -132,6 +141,110 @@ class LITSDatasetB2ND(Dataset):
 
         return img_patch, seg_patch
 
+    # -------------------- 肝脏 ROI 包围盒 -------------------- #
+    @staticmethod
+    def _get_liver_bbox(seg: np.ndarray, margin: int = 10) -> Optional[Tuple[int, int, int, int, int, int]]:
+        """
+        从 seg 中提取肝脏 (seg>=1) 的 3D 包围盒，并加上一点 margin。
+        seg: (Z, Y, X)
+
+        返回:
+            z_min, z_max, y_min, y_max, x_min, x_max
+        若没有肝脏（极少见），返回 None。
+        """
+        liver_mask = seg >= 1          # 肝脏 + 肿瘤
+        if not liver_mask.any():
+            return None
+
+        zz, yy, xx = np.where(liver_mask)
+        z_min, z_max = int(zz.min()), int(zz.max())
+        y_min, y_max = int(yy.min()), int(yy.max())
+        x_min, x_max = int(xx.min()), int(xx.max())
+
+        # 加 margin 再裁剪到图像范围内
+        z_min = max(0, z_min - margin)
+        y_min = max(0, y_min - margin)
+        x_min = max(0, x_min - margin)
+
+        Z, Y, X = seg.shape
+        z_max = min(Z - 1, z_max + margin)
+        y_max = min(Y - 1, y_max + margin)
+        x_max = min(X - 1, x_max + margin)
+
+        return z_min, z_max, y_min, y_max, x_min, x_max
+
+    # -------------------- 肝脏 ROI 内随机裁剪 -------------------- #
+    @staticmethod
+    def _random_crop_in_roi(
+        img: np.ndarray,
+        seg: np.ndarray,
+        patch_size: Tuple[int, int, int],
+        roi_bbox: Tuple[int, int, int, int, int, int],
+    ):
+        """
+        在给定的 ROI 包围盒内部随机裁剪 patch。
+        img: (C, Z, Y, X)
+        seg: (Z, Y, X)
+        roi_bbox: (z_min, z_max, y_min, y_max, x_min, x_max)
+        """
+        (z_min, z_max, y_min, y_max, x_min, x_max) = roi_bbox
+        _, Z, Y, X = img.shape
+        pz, py, px = patch_size
+
+        # 1) 先看 ROI 自身是否比 patch 小，如是则整幅 pad
+        roi_Z = z_max - z_min + 1
+        roi_Y = y_max - y_min + 1
+        roi_X = x_max - x_min + 1
+
+        pad_z = max(0, pz - roi_Z)
+        pad_y = max(0, py - roi_Y)
+        pad_x = max(0, px - roi_X)
+
+        if pad_z > 0 or pad_y > 0 or pad_x > 0:
+            img = np.pad(
+                img,
+                ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
+                mode="constant",
+            )
+            seg = np.pad(
+                seg,
+                ((0, pad_z), (0, pad_y), (0, pad_x)),
+                mode="constant",
+            )
+            Z += pad_z
+            Y += pad_y
+            X += pad_x
+            z_max += pad_z
+            y_max += pad_y
+            x_max += pad_x
+
+        # 2) 在 ROI 内随机确定起点 (z0, y0, x0)
+        #   保证 patch 完全落在 [z_min, z_max] 等范围内
+        max_z0 = max(z_min, z_max - pz + 1)
+        max_y0 = max(y_min, y_max - py + 1)
+        max_x0 = max(x_min, x_max - px + 1)
+
+        if max_z0 <= z_min:
+            z0 = z_min
+        else:
+            z0 = np.random.randint(z_min, max_z0 + 1)
+
+        if max_y0 <= y_min:
+            y0 = y_min
+        else:
+            y0 = np.random.randint(y_min, max_y0 + 1)
+
+        if max_x0 <= x_min:
+            x0 = x_min
+        else:
+            x0 = np.random.randint(x_min, max_x0 + 1)
+
+        img_patch = img[:, z0:z0+pz, y0:y0+py, x0:x0+px]
+        seg_patch = seg[z0:z0+pz, y0:y0+py, x0:x0+px]
+
+        return img_patch, seg_patch
+
+    # -------------------- 标签重映射 -------------------- #
     def _remap_labels(self, seg: np.ndarray) -> np.ndarray:
         """
         MSD Task03_Liver (LiTS) 标签约定:
@@ -149,12 +262,22 @@ class LITSDatasetB2ND(Dataset):
             tgt = (seg == 2).astype(np.int64)
         return tgt
 
+    # -------------------- 取一个样本 -------------------- #
     def __getitem__(self, idx):
         case_id = self.case_ids[idx]
         img, seg, _ = self._load_case_np(case_id)
 
-        # 随机 3D patch
-        img, seg = self._random_crop_with_padding(img, seg, self.patch_size)
+        # === 关键逻辑：肿瘤阶段在肝脏 ROI 内采样 ===
+        if self.stage == "tumor":
+            bbox = self._get_liver_bbox(seg, margin=10)
+            if bbox is not None:
+                img, seg = self._random_crop_in_roi(img, seg, self.patch_size, bbox)
+            else:
+                # 极少数没有肝脏标签的情况，退回到全图随机裁剪
+                img, seg = self._random_crop_with_padding(img, seg, self.patch_size)
+        else:
+            # liver 阶段：整幅 volume 上随机采 patch（原逻辑不变）
+            img, seg = self._random_crop_with_padding(img, seg, self.patch_size)
 
         # 标签映射到 0/1
         tgt = self._remap_labels(seg)  # (Z, Y, X)

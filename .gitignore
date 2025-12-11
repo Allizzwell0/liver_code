@@ -6,3 +6,5 @@ src/train_logs/
 *.pth
 *.pyc
 __pycache__/
+eval_liver_full_val/
+src/eval_liver_full_val/

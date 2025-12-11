@@ -45,7 +45,26 @@ export CUDA_VISIBLE_DEVICES=1
 可以终止，从last/best继续训练
 分为两阶段进行，先是liver，然后tumor
 ```bash
-python train.py   --preproc_dir $PREPROC_DIR   --stage liver   --epochs 200   --batch_size 2   --patch_size 96 160 160   --save_dir train_logs/lits_b2nd   --resume train_logs/lits_b2nd/liver_best.pth
+python train.py \
+  --preproc_dir $PREPROC_DIR \
+  --stage liver \
+  --epochs 300 \
+  --batch_size 2 \
+  --patch_size 128 128 128 \
+  --save_dir train_logs/lits_3dfullres_like \
+  --resume train_logs/lits_3dfullres_like/liver_interrupt.pth
+```
+
+训练时的eval是随机patch计算的，最后对模型进行完整的eval：
+```bash
+python eval_liver_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --ckpt train_logs/lits_3dfullres_like/liver_best.pth \
+  --out_dir eval_liver_full_val \
+  --split val \
+  --patch_size 128 128 128 \
+  --stride 64 64 64 \
+  --save_npy
 ```
 
 查看训练曲线：
