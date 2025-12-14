@@ -1,368 +1,415 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Two-stage inference on LiTS / MSD Task03_Liver preprocessed by nnUNetv2.
+两阶段推理脚本（LiTS, nnUNetv2 预处理结果）：
 
-Stage 1: liver model -> liver mask (ROI)
-Stage 2: tumor model -> tumor mask (only inside liver ROI)
+阶段 1：肝脏分割（liver_best.pth）
+阶段 2：在肝脏 ROI 内做肿瘤分割（tumor_best.pth）
 
-Input:
-  - nnUNetv2 preprocessed folder, e.g.
-    /home/mayue/WorldModel/Dreamer/liver/data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans_3d_fullres
-  - liver_best.pth, tumor_best.pth from your training
+输入：
+  - nnUNetv2 预处理目录（例如 Dataset003_Liver/nnUNetPlans_3d_fullres）
+  - liver 和 tumor 的 checkpoint
+  - case_id（可选；不指定则对目录下所有病例做推理）
 
-Output:
-  - for each case_id, saves:
-      <out_dir>/<case_id>/liver_mask.npy
-      <out_dir>/<case_id>/tumor_mask.npy
-    and if SimpleITK installed:
-      <out_dir>/<case_id>/liver_mask.nii.gz
-      <out_dir>/<case_id>/tumor_mask.nii.gz
+输出：
+  - <out_dir>/<case_id>_pred_liver.npy   (0/1) 肝脏预测
+  - <out_dir>/<case_id>_pred_tumor.npy   (0/1) 肿瘤预测
+  - <out_dir>/<case_id>_pred_3class.npy  (0/1/2) 最终 3 类标签
+  - 若有 GT，会打印 liver/tumor 的 Dice
+
+用法示例：
+
+  PREPROC_DIR=/home/my/liver/data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans_3d_fullres
+
+  python infer_two_stage.py \
+    --preproc_dir $PREPROC_DIR \
+    --ckpt_liver train_logs/lits_3dfullres_like/liver_best.pth \
+    --ckpt_tumor train_logs/lits_3dfullres_like_tumor/tumor_best.pth \
+    --out_dir eval_outputs \
+    --case_id Dataset003_Liver_0000
+
+  # 对目录下所有病例推理：
+  python infer_two_stage.py \
+    --preproc_dir $PREPROC_DIR \
+    --ckpt_liver train_logs/lits_3dfullres_like/liver_best.pth \
+    --ckpt_tumor train_logs/lits_3dfullres_like_tumor/tumor_best.pth \
+    --out_dir eval_outputs
 """
 
 import argparse
-import pickle as pkl
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import blosc2
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.unet3D import UNet3D  # 确保和训练时用的是同一个文件
+from models.unet3D import UNet3D  # 直接复用你训练时的 U-Net 定义
 
 
-# ----------------- IO: load preprocessed case -----------------
+# ----------------- 一些小工具函数 ----------------- #
 
-
-def load_case_b2nd(preproc_dir: Path, case_id: str):
+def load_case_np(preproc_dir: Path, case_id: str):
     """
-    从 nnUNetv2 预处理目录中读出一个病例:
-      - image: float32, (C, Z, Y, X)
-      - seg:   int16,  (Z, Y, X) 或 None（如果没有_gt）
-      - props: dict (properties.pkl 内容)
+    读取 nnUNetv2 预处理后的一个病例：
+      img: (C, Z, Y, X), float32
+      seg: (Z, Y, X), int16 （如果存在 seg.b2nd，否则 seg=None）
     """
     dparams = {"nthreads": 1}
-
-    data_file = preproc_dir / f"{case_id}.b2nd"
+    img_file = preproc_dir / f"{case_id}.b2nd"
     seg_file = preproc_dir / f"{case_id}_seg.b2nd"
     prop_file = preproc_dir / f"{case_id}.pkl"
 
-    if not data_file.is_file():
-        raise FileNotFoundError(data_file)
+    if not img_file.is_file():
+        raise FileNotFoundError(img_file)
 
-    data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams=dparams)
-    img = data_b[:].astype(np.float32)  # (C, Z, Y, X)
+    img_b = blosc2.open(urlpath=str(img_file), mode="r", dparams=dparams)
+    img = img_b[:].astype(np.float32)  # (C, Z, Y, X)
 
     seg = None
     if seg_file.is_file():
         seg_b = blosc2.open(urlpath=str(seg_file), mode="r", dparams=dparams)
-        seg = seg_b[:].astype(np.int16)  # (1, Z, Y, X) or (Z, Y, X)
-        if seg.ndim == 4:
-            seg = seg[0]
+        seg_arr = seg_b[:].astype(np.int16)
+        if seg_arr.ndim == 4:
+            seg_arr = seg_arr[0]
+        seg = seg_arr  # (Z, Y, X)
 
-    props = None
+    properties = None
     if prop_file.is_file():
+        import pickle as pkl
         with open(prop_file, "rb") as f:
-            props = pkl.load(f)
+            properties = pkl.load(f)
 
-    return img, seg, props
-
-
-# ----------------- model loading -----------------
+    return img, seg, properties
 
 
-def load_model_from_ckpt(ckpt_path: Path, device: torch.device):
+def get_liver_bbox_from_mask(mask: np.ndarray, margin: int = 10) -> Optional[Tuple[int, int, int, int, int, int]]:
     """
-    从训练保存的 .pth 里恢复 UNet3D 模型、输入通道数、类别数、patch_size.
+    从肝脏预测 mask (Z, Y, X, bool 或 0/1) 中提取 3D 包围盒 + margin。
     """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    in_channels = ckpt.get("in_channels", 1)
-    num_classes = ckpt.get("num_classes", 2)
-    patch_size = tuple(ckpt.get("patch_size", (96, 160, 160)))
+    liver_mask = mask > 0
+    if not liver_mask.any():
+        return None
 
-    model = UNet3D(in_channels=in_channels, num_classes=num_classes, base_filters=32)
-    model.load_state_dict(ckpt["model_state"])
-    model.to(device)
-    model.eval()
+    zz, yy, xx = np.where(liver_mask)
+    z_min, z_max = int(zz.min()), int(zz.max())
+    y_min, y_max = int(yy.min()), int(yy.max())
+    x_min, x_max = int(xx.min()), int(xx.max())
 
-    print(f"[load_model] {ckpt_path.name}: in_ch={in_channels}, "
-          f"num_classes={num_classes}, patch_size={patch_size}")
-    return model, num_classes, patch_size
+    Z, Y, X = mask.shape
 
+    z_min = max(0, z_min - margin)
+    y_min = max(0, y_min - margin)
+    x_min = max(0, x_min - margin)
 
-# ----------------- sliding-window inference -----------------
-
-
-def pad_to_min_shape(img: np.ndarray, patch_size: Tuple[int, int, int]):
-    """
-    确保体积在每个维度上 >= patch_size，对右/后面做 0 padding.
-    img: (C, Z, Y, X)
-    """
-    C, Z, Y, X = img.shape
-    pz, py, px = patch_size
-    Zp = max(Z, pz)
-    Yp = max(Y, py)
-    Xp = max(X, px)
-
-    pad_z = Zp - Z
-    pad_y = Yp - Y
-    pad_x = Xp - X
-
-    img_p = np.pad(
-        img,
-        ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
-        mode="constant",
-    )
-    return img_p, (Z, Y, X)
-
-
-def get_start_indices(full_size: int, patch_size: int, step: int) -> List[int]:
-    """
-    沿一个维度生成滑窗起始 index，保证末尾覆盖到结尾。
-    """
-    if full_size <= patch_size:
-        return [0]
-    starts = list(range(0, full_size - patch_size + 1, step))
-    if starts[-1] != full_size - patch_size:
-        starts.append(full_size - patch_size)
-    return starts
-
-
-def sliding_window_segmentation(
-    model: torch.nn.Module,
-    img: np.ndarray,
-    patch_size: Tuple[int, int, int],
-    device: torch.device,
-    num_classes: int = 2,
-    step_fraction: float = 0.5,
-):
-    """
-    对 (C, Z, Y, X) 整体做 3D 滑窗推理，返回:
-      - seg:  (Z, Y, X) int64, 每个 voxel 的类别
-      - probs: (C_out, Z, Y, X) float32, 概率
-    """
-    assert img.ndim == 4, f"img must be (C,Z,Y,X), got {img.shape}"
-    img_p, orig_shape = pad_to_min_shape(img, patch_size)
-    C, Zp, Yp, Xp = img_p.shape
-    pz, py, px = patch_size
-
-    step_z = max(int(pz * step_fraction), 1)
-    step_y = max(int(py * step_fraction), 1)
-    step_x = max(int(px * step_fraction), 1)
-
-    z_starts = get_start_indices(Zp, pz, step_z)
-    y_starts = get_start_indices(Yp, py, step_y)
-    x_starts = get_start_indices(Xp, px, step_x)
-
-    print(f"[SW] volume={img.shape}, padded={(C, Zp, Yp, Xp)}, "
-          f"patch={patch_size}, steps=({step_z},{step_y},{step_x}), "
-          f"num_tiles={len(z_starts)*len(y_starts)*len(x_starts)}")
-
-    probs = np.zeros((num_classes, Zp, Yp, Xp), dtype=np.float32)
-    counts = np.zeros((1, Zp, Yp, Xp), dtype=np.float32)
-
-    model.eval()
-    with torch.no_grad():
-        for zs in z_starts:
-            for ys in y_starts:
-                for xs in x_starts:
-                    patch = img_p[:, zs:zs+pz, ys:ys+py, xs:xs+px]  # (C,pz,py,px)
-                    patch_t = torch.from_numpy(patch[None]).to(device)  # (1,C,pz,py,px)
-
-                    logits = model(patch_t)   # (1,C_out,*,*,*)
-                    probs_patch = F.softmax(logits, dim=1)[0].cpu().numpy()  # (C_out,pz,py,px)
-
-                    probs[:, zs:zs+pz, ys:ys+py, xs:xs+px] += probs_patch
-                    counts[:, zs:zs+pz, ys:ys+py, xs:xs+px] += 1.0
-
-    counts[counts == 0] = 1.0
-    probs = probs / counts
-
-    Z, Y, X = orig_shape
-    probs = probs[:, :Z, :Y, :X]  # 去掉 padding
-    seg = np.argmax(probs, axis=0).astype(np.int64)
-    return seg, probs
-
-
-# ----------------- ROI: liver bbox -----------------
-
-
-def compute_liver_bbox(liver_mask: np.ndarray, margin: int = 5):
-    """
-    liver_mask: (Z,Y,X) bool/0-1
-    返回 (z_min,z_max,y_min,y_max,x_min,x_max)
-    若未检测到肝，则返回整幅 bbox.
-    """
-    assert liver_mask.ndim == 3
-    Z, Y, X = liver_mask.shape
-    coords = np.where(liver_mask > 0)
-    if coords[0].size == 0:
-        print("[WARN] No liver voxels detected, using full volume as ROI.")
-        return 0, Z, 0, Y, 0, X
-
-    z_min, z_max = coords[0].min(), coords[0].max() + 1
-    y_min, y_max = coords[1].min(), coords[1].max() + 1
-    x_min, x_max = coords[2].min(), coords[2].max() + 1
-
-    z_min = max(z_min - margin, 0)
-    y_min = max(y_min - margin, 0)
-    x_min = max(x_min - margin, 0)
-    z_max = min(z_max + margin, Z)
-    y_max = min(y_max + margin, Y)
-    x_max = min(x_max + margin, X)
+    z_max = min(Z - 1, z_max + margin)
+    y_max = min(Y - 1, y_max + margin)
+    x_max = min(X - 1, x_max + margin)
 
     return z_min, z_max, y_min, y_max, x_min, x_max
 
 
-# ----------------- NIfTI saving -----------------
-
-
-def save_segmentation(seg: np.ndarray, out_path: Path):
+def make_sliding_windows(
+    Z: int,
+    Y: int,
+    X: int,
+    pz: int,
+    py: int,
+    px: int,
+    overlap: float = 0.5,
+) -> List[Tuple[int, int, int]]:
     """
-    尝试保存为 NIfTI，如果没有 SimpleITK 就只打印提示。
-    seg: (Z,Y,X) int/uint8
+    为 3D 体数据生成滑窗起点列表 (z0, y0, x0)。
+    overlap ∈ [0,1)，比如 0.5 表示步长约为 patch_size 的一半。
     """
-    seg = seg.astype(np.uint8)
-    try:
-        import SimpleITK as sitk
-    except ImportError:
-        print(f"[WARN] SimpleITK not installed, skip NIfTI save for {out_path}")
-        return
+    assert 0 <= overlap < 1.0
+    def _compute_starts(dim, p):
+        if dim <= p:
+            return [0]
+        step = int(p * (1 - overlap))
+        step = max(1, step)
+        starts = list(range(0, dim - p + 1, step))
+        if starts[-1] != dim - p:
+            starts.append(dim - p)
+        return starts
 
-    img_sitk = sitk.GetImageFromArray(seg)  # 默认 spacing=(1,1,1)，方便在 Slicer 里简单查看
-    sitk.WriteImage(img_sitk, str(out_path))
-    print(f"[INFO] Saved NIfTI to {out_path}")
+    z_starts = _compute_starts(Z, pz)
+    y_starts = _compute_starts(Y, py)
+    x_starts = _compute_starts(X, px)
+
+    windows = []
+    for z0 in z_starts:
+        for y0 in y_starts:
+            for x0 in x_starts:
+                windows.append((z0, y0, x0))
+    return windows
 
 
-# ----------------- two-stage pipeline for one case -----------------
-
-
-def run_two_stage_for_case(
-    preproc_dir: Path,
-    liver_model: torch.nn.Module,
-    tumor_model: torch.nn.Module,
-    case_id: str,
-    out_dir: Path,
+def sliding_window_predict(
+    img: np.ndarray,
+    model: torch.nn.Module,
     device: torch.device,
+    patch_size: Tuple[int, int, int],
+    num_classes: int,
+    batch_size: int = 1,
+    overlap: float = 0.5,
+) -> np.ndarray:
+    """
+    对整幅体数据 img 做 3D 滑窗推理。
+    img: (C, Z, Y, X)  numpy
+    返回:
+      pred (Z, Y, X) int64, 为 argmax 后的类别（0~C-1）
+    """
+    model.eval()
+    C, Z, Y, X = img.shape
+    pz, py, px = patch_size
+
+    windows = make_sliding_windows(Z, Y, X, pz, py, px, overlap=overlap)
+
+    # 累积概率和计数器用于 average
+    prob_vol = np.zeros((num_classes, Z, Y, X), dtype=np.float32)
+    count_vol = np.zeros((1, Z, Y, X), dtype=np.float32)
+
+    with torch.no_grad():
+        # 为了效率，支持简单的 batch 推理
+        for i in range(0, len(windows), batch_size):
+            batch_windows = windows[i:i + batch_size]
+            batch_imgs = []
+            for (z0, y0, x0) in batch_windows:
+                patch = img[:, z0:z0+pz, y0:y0+py, x0:x0+px]
+                batch_imgs.append(patch)
+
+            batch_arr = np.stack(batch_imgs, axis=0)  # (B, C, pz, py, px)
+            batch_tensor = torch.from_numpy(batch_arr).to(device=device, dtype=torch.float32)
+
+            logits = model(batch_tensor)  # (B, num_classes, pz, py, px)
+            probs = F.softmax(logits, dim=1).cpu().numpy()
+
+            for b, (z0, y0, x0) in enumerate(batch_windows):
+                prob_vol[:, z0:z0+pz, y0:y0+py, x0:x0+px] += probs[b]
+                count_vol[:, z0:z0+pz, y0:y0+py, x0:x0+px] += 1.0
+
+    # 避免除 0
+    count_vol[count_vol == 0] = 1.0
+    prob_vol /= count_vol
+
+    pred = np.argmax(prob_vol, axis=0).astype(np.int64)  # (Z, Y, X)
+    return pred
+
+
+def binary_dice(pred: np.ndarray, target: np.ndarray, eps: float = 1e-5) -> float:
+    """
+    pred, target: (Z, Y, X), 0/1
+    """
+    pred_fg = (pred > 0).astype(np.float32)
+    tgt_fg = (target > 0).astype(np.float32)
+    inter = np.sum(pred_fg * tgt_fg)
+    union = np.sum(pred_fg) + np.sum(tgt_fg)
+    dice = (2 * inter + eps) / (union + eps)
+    return float(dice)
+
+
+# ----------------- 载入模型 ----------------- #
+
+def load_model_from_ckpt(ckpt_path: Path, device: torch.device) -> Tuple[torch.nn.Module, Tuple[int, int, int]]:
+    """
+    根据训练保存的 checkpoint 恢复 UNet3D 模型，并返回模型 + patch_size。
+    """
+    ckpt = torch.load(ckpt_path, map_location=device)
+    in_channels = ckpt.get("in_channels", 1)
+    num_classes = ckpt.get("num_classes", 2)
+    patch_size = tuple(ckpt.get("patch_size", (128, 128, 128)))
+
+    model = UNet3D(in_channels=in_channels, num_classes=num_classes, base_filters=32, dropout_p=0.0)
+    model.load_state_dict(ckpt["model_state"])
+    model.to(device)
+    model.eval()
+
+    print(f"[CKPT] Loaded {ckpt_path.name}: in_channels={in_channels}, num_classes={num_classes}, patch_size={patch_size}")
+    return model, patch_size
+
+
+# ----------------- 主推理逻辑 ----------------- #
+
+def run_two_stage_inference_for_case(
+    preproc_dir: Path,
+    case_id: str,
+    liver_model: torch.nn.Module,
     liver_patch_size: Tuple[int, int, int],
+    tumor_model: torch.nn.Module,
     tumor_patch_size: Tuple[int, int, int],
+    device: torch.device,
+    out_dir: Path,
+    overlap: float = 0.5,
 ):
-    print(f"\n========== Case {case_id} ==========")
-    img, seg_gt, props = load_case_b2nd(preproc_dir, case_id)
-    print(f"[CASE] img shape={img.shape}, seg_gt={None if seg_gt is None else seg_gt.shape}")
+    """
+    对单个 case 执行两阶段推理。
+    """
+    print(f"\n===== Case: {case_id} =====")
+    img, seg, _ = load_case_np(preproc_dir, case_id)  # img: (C, Z, Y, X)
 
-    # -------- Stage 1: liver segmentation --------
+    C, Z, Y, X = img.shape
+    print(f"[INFO] Image shape: C={C}, Z={Z}, Y={Y}, X={X}")
+
+    # ---------- 阶段 1：肝脏分割 ---------- #
     print("[Stage 1] Liver segmentation...")
-    liver_seg, liver_probs = sliding_window_segmentation(
-        liver_model,
-        img,
-        liver_patch_size,
-        device,
-        num_classes=2,
-        step_fraction=0.5,
-    )
-    liver_mask = (liver_seg == 1)
+    liver_pred = sliding_window_predict(
+        img=img,
+        model=liver_model,
+        device=device,
+        patch_size=liver_patch_size,
+        num_classes=2,      # liver 模型是二分类：0 背景, 1 肝+瘤
+        batch_size=1,
+        overlap=overlap,
+    )  # (Z, Y, X)
+    liver_mask = (liver_pred == 1)
 
-    # -------- ROI: compute bbox from liver --------
-    z_min, z_max, y_min, y_max, x_min, x_max = compute_liver_bbox(liver_mask, margin=5)
-    print(f"[ROI] liver bbox: z[{z_min}:{z_max}], y[{y_min}:{y_max}], x[{x_min}:{x_max}]")
+    # ---------- 提取肝脏 ROI ---------- #
+    bbox = get_liver_bbox_from_mask(liver_mask, margin=10)
+    if bbox is None:
+        print("[WARN] Liver ROI not found, tumor stage will run on full volume.")
+        roi_zmin, roi_zmax = 0, Z - 1
+        roi_ymin, roi_ymax = 0, Y - 1
+        roi_xmin, roi_xmax = 0, X - 1
+    else:
+        roi_zmin, roi_zmax, roi_ymin, roi_ymax, roi_xmin, roi_xmax = bbox
+    print(f"[ROI] z: [{roi_zmin}, {roi_zmax}], y: [{roi_ymin}, {roi_ymax}], x: [{roi_xmin}, {roi_xmax}]")
 
-    img_roi = img[:, z_min:z_max, y_min:y_max, x_min:x_max]
-    liver_mask_roi = liver_mask[z_min:z_max, y_min:y_max, x_min:x_max]
+    # ---------- 阶段 2：肿瘤分割（在 ROI 内） ---------- #
+    print("[Stage 2] Tumor segmentation within liver ROI...")
+    img_roi = img[:, roi_zmin:roi_zmax+1, roi_ymin:roi_ymax+1, roi_xmin:roi_xmax+1]
 
-    # -------- Stage 2: tumor segmentation inside ROI --------
-    print("[Stage 2] Tumor segmentation in liver ROI...")
-    tumor_seg_roi, tumor_probs_roi = sliding_window_segmentation(
-        tumor_model,
-        img_roi,
-        tumor_patch_size,
-        device,
-        num_classes=2,
-        step_fraction=0.5,
-    )
-    tumor_mask_roi = (tumor_seg_roi == 1)
+    tumor_pred_roi = sliding_window_predict(
+        img=img_roi,
+        model=tumor_model,
+        device=device,
+        patch_size=tumor_patch_size,
+        num_classes=2,      # tumor 模型是二分类：0 非瘤, 1 瘤
+        batch_size=1,
+        overlap=overlap,
+    )  # (Z_roi, Y_roi, X_roi)
 
-    # 只允许肿瘤出现在肝内
-    tumor_mask_roi = np.logical_and(tumor_mask_roi, liver_mask_roi)
+    # 把 ROI 内的肿瘤预测贴回整幅
+    tumor_pred_full = np.zeros((Z, Y, X), dtype=np.int64)
+    tumor_pred_full[roi_zmin:roi_zmax+1, roi_ymin:roi_ymax+1, roi_xmin:roi_xmax+1] = tumor_pred_roi
+    tumor_mask = (tumor_pred_full == 1)
 
-    # 回填到全 volume
-    Z, Y, X = liver_mask.shape
-    liver_mask_full = liver_mask.astype(np.uint8)
-    tumor_mask_full = np.zeros((Z, Y, X), dtype=np.uint8)
-    tumor_mask_full[z_min:z_max, y_min:y_max, x_min:x_max] = tumor_mask_roi.astype(np.uint8)
+    # ---------- 组合成 3 类标签 ---------- #
+    # 0: 背景
+    # 1: 肝脏（含肿瘤）
+    # 2: 肿瘤
+    pred_3class = np.zeros((Z, Y, X), dtype=np.int16)
+    pred_3class[liver_mask] = 1
+    pred_3class[tumor_mask & liver_mask] = 2   # 确保肿瘤在肝脏内部
 
-    # -------- Save --------
-    case_out_dir = out_dir / case_id
-    case_out_dir.mkdir(parents=True, exist_ok=True)
+    # ---------- 如果有 GT，算一下 Dice ---------- #
+    if seg is not None:
+        liver_gt = (seg >= 1)     # GT 肝脏：1 或 2
+        tumor_gt = (seg == 2)     # GT 肿瘤：2
 
-    np.save(case_out_dir / "liver_mask.npy", liver_mask_full)
-    np.save(case_out_dir / "tumor_mask.npy", tumor_mask_full)
-    print(f"[SAVE] liver_mask.npy & tumor_mask.npy saved to {case_out_dir}")
+        liver_dice = binary_dice(liver_mask.astype(np.int32), liver_gt.astype(np.int32))
+        tumor_dice = binary_dice(tumor_mask.astype(np.int32), tumor_gt.astype(np.int32))
+        print(f"[METRIC] Liver Dice = {liver_dice:.4f}")
+        print(f"[METRIC] Tumor Dice = {tumor_dice:.4f}")
+    else:
+        print("[INFO] No GT segmentation found (.b2nd), skip Dice evaluation.")
 
-    save_segmentation(liver_mask_full, case_out_dir / "liver_mask.nii.gz")
-    save_segmentation(tumor_mask_full, case_out_dir / "tumor_mask.nii.gz")
+    # ---------- 保存结果 ---------- #
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.save(out_dir / f"{case_id}_pred_liver.npy", liver_mask.astype(np.uint8))
+    np.save(out_dir / f"{case_id}_pred_tumor.npy", tumor_mask.astype(np.uint8))
+    np.save(out_dir / f"{case_id}_pred_3class.npy", pred_3class)
+
+    print(f"[SAVE] Liver mask -> {out_dir / (case_id + '_pred_liver.npy')}")
+    print(f"[SAVE] Tumor mask -> {out_dir / (case_id + '_pred_tumor.npy')}")
+    print(f"[SAVE] 3-class seg -> {out_dir / (case_id + '_pred_3class.npy')}")
 
 
-# ----------------- main -----------------
-
+# ----------------- CLI ----------------- #
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Two-stage liver/tumor inference on nnUNet preprocessed LiTS data")
-    parser.add_argument("--preproc_dir", type=str, required=True,
-                        help="nnUNetv2 preprocessed folder, e.g. .../Dataset003_Liver/nnUNetPlans_3d_fullres")
-    parser.add_argument("--liver_ckpt", type=str, required=True,
-                        help="Checkpoint path for liver model, e.g. train_logs/lits_b2nd/liver_best.pth")
-    parser.add_argument("--tumor_ckpt", type=str, required=True,
-                        help="Checkpoint path for tumor model, e.g. train_logs/lits_b2nd/tumor_best.pth")
-    parser.add_argument("--out_dir", type=str, default="infer_output",
-                        help="Directory to save predictions")
-    parser.add_argument("--case_id", type=str, default=None,
-                        help="Specific case id (without extension). If not set, run all cases in preproc_dir")
-    parser.add_argument("--use_liver_patch_for_tumor", action="store_true",
-                        help="Use liver model patch_size for tumor model as well")
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preproc_dir",
+        type=str,
+        required=True,
+        help="nnUNetv2 预处理目录，例如 Dataset003_Liver/nnUNetPlans_3d_fullres",
+    )
+    parser.add_argument(
+        "--ckpt_liver",
+        type=str,
+        required=True,
+        help="肝脏分割模型 checkpoint 路径，例如 train_logs/.../liver_best.pth",
+    )
+    parser.add_argument(
+        "--ckpt_tumor",
+        type=str,
+        required=True,
+        help="肿瘤分割模型 checkpoint 路径，例如 train_logs/.../tumor_best.pth",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        required=True,
+        help="推理结果保存目录",
+    )
+    parser.add_argument(
+        "--case_id",
+        type=str,
+        default=None,
+        help="单个 case_id（不填则处理 preproc_dir 下所有 *.pkl 对应病例）",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=0.5,
+        help="滑窗 overlap 比例，0~1，默认 0.5 (步长约 patch_size 一半)",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=0,
+        help="使用的 GPU id（单机多卡时）",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("[Device]", device)
+
+    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
 
     preproc_dir = Path(args.preproc_dir)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_liver = Path(args.ckpt_liver)
+    ckpt_tumor = Path(args.ckpt_tumor)
 
-    # 1) load models
-    liver_model, liver_num_classes, liver_patch_size = load_model_from_ckpt(Path(args.liver_ckpt), device)
-    tumor_model, tumor_num_classes, tumor_patch_size = load_model_from_ckpt(Path(args.tumor_ckpt), device)
+    # 载入 liver / tumor 模型
+    liver_model, liver_patch = load_model_from_ckpt(ckpt_liver, device)
+    tumor_model, tumor_patch = load_model_from_ckpt(ckpt_tumor, device)
 
-    if liver_num_classes != 2 or tumor_num_classes != 2:
-        print("[WARN] This script assumes binary models (2 classes).")
-
-    if args.use_liver_patch_for_tumor:
-        tumor_patch_size = liver_patch_size
-        print(f"[INFO] Using liver_patch_size={liver_patch_size} for tumor model as well.")
-
-    # 2) cases to run
+    # 决定要推理哪些 case
     if args.case_id is not None:
         case_ids = [args.case_id]
     else:
-        # 用所有 .pkl 的 stem 作为 case_id
-        case_ids = sorted(p.stem for p in preproc_dir.glob("*.pkl"))
-        print(f"[INFO] Found {len(case_ids)} cases in {preproc_dir}")
+        # 用 .pkl 名称作为 case_id（与训练时一致）
+        all_pkl = sorted(preproc_dir.glob("*.pkl"))
+        case_ids = [p.stem for p in all_pkl]
+    print(f"[INFO] Will run inference for {len(case_ids)} cases.")
 
     for cid in case_ids:
-        run_two_stage_for_case(
-            preproc_dir,
-            liver_model,
-            tumor_model,
-            cid,
-            out_dir,
-            device,
-            liver_patch_size,
-            tumor_patch_size,
+        run_two_stage_inference_for_case(
+            preproc_dir=preproc_dir,
+            case_id=cid,
+            liver_model=liver_model,
+            liver_patch_size=liver_patch,
+            tumor_model=tumor_model,
+            tumor_patch_size=tumor_patch,
+            device=device,
+            out_dir=out_dir,
+            overlap=args.overlap,
         )
 
 
