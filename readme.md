@@ -59,10 +59,11 @@ python train.py \
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage tumor \
-  --epochs 300 \
+  --epochs 1000 \
   --batch_size 2 \
   --patch_size 128 128 128 \
-  --save_dir train_logs/lits_3dfullres_like_tumor
+  --save_dir train_logs/lits_3dfullres_like_tumor \
+  --resume train_logs/lits_3dfullres_like_tumor/tumor_best.pth
 ```
 
 训练时的eval是随机patch计算的，最后对模型进行完整的eval：
@@ -102,20 +103,28 @@ tensorboard --logdir train_logs --port 6006
 
 后续想在模型基础上对自己的数据（CT .nrrd）进行一些测试，此处记录数据预处理及输入方式
 预处理代码保存在dataload下，使用方法：
+发现存在不同医学图像方向不同的情况，比如现在使用的LiTS数据集是RAS，对预处理部分增加方向选项
 ```bash
 # 无标注数据
-  python dataload/preprocess_ct_data.py \
-    --input_nrrd /home/my/data/liver_data/self_data/origin_CT/6.nrrd \
-    --plans_json /home/my/data/liver_data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
-    --case_id my_case001 \
-    --out_dir /home/my/data/liver_data/self_data/prepocessed_data
+python dataload/preprocess_ct_data.py \
+  --input_nrrd /home/my/data/liver_data/self_data/RAS_CT/6_RAS.nrrd \
+  --plans_json /home/my/data/liver_data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
+  --case_id my_case001 \
+  --out_dir /home/my/data/liver_data/self_data/prepocessed_data \
+
 # 标注数据
-  python dataload/preprocess_ct_data.py \
-    --input_nrrd /home/my/data/liver_data/self_data/origin_CT/14.nrrd \
-    --seg_nrrd /home/my/data/liver_data/self_data/origin_CT/14_seg.nrrd \
-    --plans_json /home/my/data/liver_data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
-    --case_id my_case001 \
-    --out_dir /home/my/data/liver_data/self_data/prepocessed_data/seg_data
+python dataload/preprocess_ct_data.py \
+  --input_nrrd /home/my/data/liver_data/self_data/RAS_CT/6_RAS.nrrd \
+  --seg_nrrd /path/to/seg.nrrd \
+  --plans_json /home/my/data/liver_data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
+  --case_id my_case001 \
+  --out_dir /home/my/data/liver_data/self_data/prepocessed_data \
+```
+同时增加新的脚本，对nrrd转换坐标
+```bash
+python dataload/reorient_to_RAS.py \
+    --input /home/my/data/liver_data/self_data/origin_CT \
+    --output /home/my/data/liver_data/self_data/RAS_CT
 ```
 
 完成上述处理后，在推理前重新设置PREPROC_DIR
@@ -137,7 +146,12 @@ PREPROC_DIR=//home/my/data/liver_data/self_data/prepocessed_data
 为了3Dslicer可以查看，将数据和推理结果合成nrrd文件：
 ```bash
 python export_nrrd.py \
-    --img_b2nd /home/my/data/liver_data/self_data/prepocessed_data/my_case001.b2nd \
-    --seg_npy  /home/my/data/liver_data/eval_outputs/my_data/my_case001_pred_3class.npy \
-    --out_prefix /home/my/data/liver_data/self_data/slicer/my_case001 \
+    --orig_ct /home/my/data/liver_data/self_data/RAS_CT/6_RAS.nrrd \
+    --seg_npy /home/my/data/liver_data/eval_outputs/my_data/my_case001_pred_3class.npy \
+    --spacing 1.0 0.767578125 0.767578125 \
+    --out_seg /home/my/data/liver_data/self_data/slicer/my_case001_seg_on_orig.nrrd \
+    --flip_z
 ```
+
+记录新编号与原编号关系：
+1-6 2-8 3-9 4-14
