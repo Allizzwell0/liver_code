@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-将 nrrd 预处理并保存为 nnUNet 风格的 .b2nd + .pkl，供 load_case_np 直接读取。
-
-示例（只有图像，无标注）:
-  python preprocess_to_b2nd.py \
-    --input_nrrd /data/my_case/Delay_Phase_B10f.nrrd \
-    --plans_json /home/my/liver/data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
-    --case_id my_case001 \
-    --out_dir /home/my/liver/custom_preprocessed
-
-示例（有图像 + segmentation）:
-  python preprocess_to_b2nd.py \
-    --input_nrrd /data/my_case/Delay_Phase_B10f.nrrd \
-    --seg_nrrd   /data/my_case/Segmentation.seg.nrrd \
-    --plans_json /home/my/liver/data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans.json \
-    --case_id my_case001 \
-    --out_dir /home/my/liver/custom_preprocessed
-"""
 
 import argparse
 import json
@@ -29,16 +11,13 @@ import numpy as np
 import SimpleITK as sitk
 
 
+# ------------------ nnUNet plans 读取 ------------------ #
 def load_plans(plans_json: str, config: str = "3d_fullres"):
-    """
-    从 nnUNetPlans.json 读取 target spacing (3d_fullres) 和 CTNormalization 统计量。
-    """
     plans_json = Path(plans_json)
-    with open(plans_json, "r") as f:
-        plans = json.load(f)
+    plans = json.loads(plans_json.read_text())
 
     cfg = plans["configurations"][config]
-    target_spacing_zyx = cfg["spacing"]  # [z, y, x]
+    target_spacing_zyx = cfg["spacing"]  # [z,y,x]
 
     fg_props = plans["foreground_intensity_properties_per_channel"]["0"]
     stats = {
@@ -50,202 +29,196 @@ def load_plans(plans_json: str, config: str = "3d_fullres"):
     return target_spacing_zyx, stats
 
 
-def resample_image_sitk(img: sitk.Image, target_spacing_zyx, is_seg: bool = False):
+# ------------------ 方向统一到 RAS ------------------ #
+def reorient_to_ras(img: sitk.Image) -> sitk.Image:
     """
-    用 SimpleITK 重采样到目标 spacing。
-    nnUNet spacing 为 [z,y,x]，SimpleITK 需要 (x,y,z)。
-    segmentation 用最近邻，图像用 BSpline。
+    把图像重排到 RAS（Right-Anterior-Superior）方向。
+    这是“物理空间一致”的重排：会更新 direction/origin，并对应重排像素。
     """
-    orig_spacing = np.array(list(img.GetSpacing()), dtype=float)  # (x,y,z)
-    orig_size = np.array(list(img.GetSize()), dtype=int)
+    # SimpleITK 内置：DICOMOrientImageFilter 接受 "RAS"
+    f = sitk.DICOMOrientImageFilter()
+    f.SetDesiredCoordinateOrientation("RAS")
+    return f.Execute(img)
 
-    target_spacing_zyx = np.array(target_spacing_zyx, dtype=float)
-    target_spacing_xyz = np.array(
-        [target_spacing_zyx[2], target_spacing_zyx[1], target_spacing_zyx[0]],
-        dtype=float,
-    )
 
-    new_size = np.round(orig_size * (orig_spacing / target_spacing_xyz)).astype(int)
+# ------------------ 重采样到 target spacing ------------------ #
+def resample_to_spacing(img: sitk.Image, target_spacing_zyx, is_seg=False) -> sitk.Image:
+    """
+    nnUNet 的 spacing 是 [z,y,x]，SITK spacing 是 (x,y,z)
+    """
+    target_spacing_xyz = (float(target_spacing_zyx[2]),
+                          float(target_spacing_zyx[1]),
+                          float(target_spacing_zyx[0]))
+
+    orig_spacing = img.GetSpacing()
+    orig_size = img.GetSize()
+
+    new_size = [
+        int(np.round(orig_size[i] * (orig_spacing[i] / target_spacing_xyz[i])))
+        for i in range(3)
+    ]
 
     resampler = sitk.ResampleImageFilter()
-    if is_seg:
-        resampler.SetInterpolator(sitk.sitkNearestNeighbor)
-    else:
-        resampler.SetInterpolator(sitk.sitkBSpline)
-
-    resampler.SetOutputSpacing(tuple(target_spacing_xyz))
-    resampler.SetSize([int(s) for s in new_size])
+    resampler.SetOutputSpacing(target_spacing_xyz)
+    resampler.SetSize(new_size)
     resampler.SetOutputDirection(img.GetDirection())
     resampler.SetOutputOrigin(img.GetOrigin())
-    resampler.SetDefaultPixelValue(0.0)
-    resampler.SetOutputPixelType(sitk.sitkFloat32 if not is_seg else sitk.sitkInt16)
+    resampler.SetTransform(sitk.Transform())
+    resampler.SetDefaultPixelValue(0)
+
+    if is_seg:
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor)
+        resampler.SetOutputPixelType(sitk.sitkInt16)
+    else:
+        # nnUNet CT 常用 BSpline / Linear 都行，BSpline更平滑但更慢
+        resampler.SetInterpolator(sitk.sitkBSpline)
+        resampler.SetOutputPixelType(sitk.sitkFloat32)
 
     return resampler.Execute(img)
 
 
-def ct_normalize_like_nnunet(volume_zyx: np.ndarray, stats: dict) -> np.ndarray:
+# ------------------ nnUNet CTNormalization ------------------ #
+def ct_normalize_like_nnunet(vol_zyx: np.ndarray, stats: dict) -> np.ndarray:
     """
-    按 nnUNet 的 CTNormalization：
-      - clip 到 [p00_5, p99_5]
-      - 减 mean / 除 std
-    输入: (Z, Y, X)，输出: (1, Z, Y, X)
+    输入: (Z,Y,X) float32（最好是 HU）
+    输出: (1,Z,Y,X) float32
     """
-    v = volume_zyx.astype(np.float32)
+    v = vol_zyx.astype(np.float32)
     v = np.clip(v, stats["p00_5"], stats["p99_5"])
-    std = stats["std"] if stats["std"] > 0 else 1.0
+    std = stats["std"] if stats["std"] > 1e-8 else 1.0
     v = (v - stats["mean"]) / std
-    v = v[None, ...]  # (1, Z, Y, X)
-    return v.astype(np.float32)
+    return v[None, ...].astype(np.float32)
 
 
-def save_b2nd(array: np.ndarray, out_path: Path):
-    """
-    使用 blosc2 保存 numpy array 到 .b2nd
-    最终格式：
-      - 4D: (C, Z, Y, X)
-      - dtype: float32 (image) 或 int16 (seg)
-
-    允许输入:
-      - 3D: (Z, Y, X)  → 自动在前面加一个通道维度
-      - 4D: (C, Z, Y, X)
-    """
+# ------------------ 保存 b2nd ------------------ #
+def save_b2nd_4d(array_4d: np.ndarray, out_path: Path):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    array = np.ascontiguousarray(array)
-
-    # 如果是 3D，就自动变成 (1, Z, Y, X)
-    if array.ndim == 3:
-        array = array[None, ...]
-    elif array.ndim != 4:
-        raise ValueError(
-            f"save_b2nd expects 3D or 4D array, got shape={array.shape}"
-        )
+    array_4d = np.ascontiguousarray(array_4d)
+    assert array_4d.ndim == 4, f"expect (C,Z,Y,X), got {array_4d.shape}"
 
     blosc2.set_nthreads(1)
+    if out_path.exists():
+        out_path.unlink()
 
-    C, Z, Y, X = array.shape
-
-    # 压缩参数：ZSTD + 中等压缩等级
     cparams = blosc2.CParams(
         clevel=5,
         codec=blosc2.Codec.ZSTD,
-        typesize=int(array.dtype.itemsize),
+        typesize=int(array_4d.dtype.itemsize),
     )
     dparams = {"nthreads": 1}
 
-    # chunk 形状，尽量不要太大，nnUNet 里通常每维不超过 128
-    chunks = (
-        min(1, C),            # 通道一般就是 1
-        min(128, Z),
-        min(128, Y),
-        min(128, X),
-    )
-
-    # 用 blosc2.open 创建磁盘后端 NDArray，然后整体写入
-    b2 = blosc2.open(
-        urlpath=str(out_path),
-        mode="w",
-        dtype=array.dtype,
-        shape=array.shape,
-        chunks=chunks,
-        cparams=cparams,
-        dparams=dparams,
-    )
-    b2[:] = array  # 一次性写入数据
-
-    print(f"[INFO] Saved b2nd: {out_path}, shape={array.shape}, dtype={array.dtype}")
+    _ = blosc2.asarray(array_4d, urlpath=str(out_path), cparams=cparams, dparams=dparams)
+    print(f"[OK] Saved b2nd: {out_path} | shape={array_4d.shape} | dtype={array_4d.dtype}")
 
 
-def preprocess_to_b2nd(
+# ------------------ 主流程 ------------------ #
+def preprocess_one_case(
     input_nrrd: str,
     plans_json: str,
     case_id: str,
     out_dir: str,
-    seg_nrrd: str | None = None,
     config: str = "3d_fullres",
+    seg_nrrd: str | None = None,
+    force_ras: bool = True,
 ):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 读取 nnUNet plans
     target_spacing_zyx, stats = load_plans(plans_json, config=config)
-    print(f"[INFO] target_spacing (zyx) = {target_spacing_zyx}")
+    print("[INFO] target_spacing_zyx:", target_spacing_zyx)
+    print("[INFO] nnUNet CT stats:", stats)
 
-    # 2) 读原始 CT
+    # 1) 读取
     img = sitk.ReadImage(str(input_nrrd))
-    orig_spacing = img.GetSpacing()
-    orig_origin = img.GetOrigin()
-    orig_direction = img.GetDirection()
-    print(f"[INFO] original spacing (xyz) = {orig_spacing}")
+    print("[INFO] original:")
+    print("  size     :", img.GetSize())
+    print("  spacing  :", img.GetSpacing())
+    print("  origin   :", img.GetOrigin())
+    print("  direction:", img.GetDirection())
 
-    # 3) 重采样 CT 到 nnUNet spacing
-    img_resampled = resample_image_sitk(img, target_spacing_zyx, is_seg=False)
-    vol_zyx = sitk.GetArrayFromImage(img_resampled)  # (Z, Y, X)
+    # 2) 方向统一（强烈建议做，尤其你已经遇到左右/上下翻转问题）
+    if force_ras:
+        img = reorient_to_ras(img)
+        print("[INFO] after RAS reorient:")
+        print("  direction:", img.GetDirection())
 
-    # 4) CTNormalization
-    vol_norm = ct_normalize_like_nnunet(vol_zyx, stats)  # (1, Z, Y, X)
+    # 3) 重采样到 nnUNet spacing
+    img_r = resample_to_spacing(img, target_spacing_zyx, is_seg=False)
+    vol_zyx = sitk.GetArrayFromImage(img_r)  # (Z,Y,X)
+
+    # 4) 强度处理（nnUNet 的 CTNormalization）
+    vol_norm = ct_normalize_like_nnunet(vol_zyx, stats)  # (1,Z,Y,X)
 
     # 5) 保存 image.b2nd
     img_b2nd_path = out_dir / f"{case_id}.b2nd"
-    save_b2nd(vol_norm, img_b2nd_path)
+    save_b2nd_4d(vol_norm, img_b2nd_path)
 
-    # 6) 如果给了 segmentation，也一起做 b2nd
-    seg_arr_resampled = None
+    # 6) seg（如果有），也走同样几何流程：RAS + resample（nearest）
+    seg_info = None
     if seg_nrrd is not None:
-        seg_img = sitk.ReadImage(str(seg_nrrd))
-        # 假设 seg 的物理空间和 input_nrrd 是对齐的（通常是）
-        seg_img_resampled = resample_image_sitk(seg_img, target_spacing_zyx, is_seg=True)
-        seg_zyx = sitk.GetArrayFromImage(seg_img_resampled).astype(np.int16)  # (Z, Y, X)
-
+        seg = sitk.ReadImage(str(seg_nrrd))
+        if force_ras:
+            seg = reorient_to_ras(seg)
+        seg_r = resample_to_spacing(seg, target_spacing_zyx, is_seg=True)
+        seg_zyx = sitk.GetArrayFromImage(seg_r).astype(np.int16)  # (Z,Y,X)
         seg_b2nd_path = out_dir / f"{case_id}_seg.b2nd"
-        # 这里直接传 3D，save_b2nd 内部会自动加通道维
-        save_b2nd(seg_zyx, seg_b2nd_path)
-        seg_arr_resampled = seg_zyx
+        save_b2nd_4d(seg_zyx[None, ...], seg_b2nd_path)
+        seg_info = {
+            "seg_shape_zyx": tuple(seg_zyx.shape),
+            "seg_unique": np.unique(seg_zyx).tolist(),
+        }
 
-
-    # 7) 保存 properties.pkl
+    # 7) properties.pkl：把“几何信息”记录下来，后续把预测映射回原始空间要用
     props = {
         "case_id": case_id,
-        "orig_spacing_xyz": tuple(orig_spacing),
-        "orig_origin": tuple(orig_origin),
-        "orig_direction": tuple(orig_direction),
+        "config": config,
         "target_spacing_zyx": tuple(target_spacing_zyx),
-        "image_shape_after_preproc": vol_norm.shape,  # (1, Z, Y, X)
-    }
-    if seg_arr_resampled is not None:
-        props["seg_shape_after_preproc"] = seg_arr_resampled.shape  # (Z, Y, X)
-        props["seg_unique_labels"] = np.unique(seg_arr_resampled).tolist()
+        "nnunet_stats": stats,
 
-    prop_path = out_dir / f"{case_id}.pkl"
-    with open(prop_path, "wb") as f:
+        # 关键：存“原始”和“预处理后”的 sitk 元信息
+        "orig_nrrd_path": str(input_nrrd),
+        "orig_size_xyz": tuple(img.GetSize()),
+        "orig_spacing_xyz": tuple(img.GetSpacing()),
+        "orig_origin_xyz": tuple(img.GetOrigin()),
+        "orig_direction": tuple(img.GetDirection()),
+
+        "preproc_size_xyz": tuple(img_r.GetSize()),
+        "preproc_spacing_xyz": tuple(img_r.GetSpacing()),
+        "preproc_origin_xyz": tuple(img_r.GetOrigin()),
+        "preproc_direction": tuple(img_r.GetDirection()),
+
+        "image_shape_after_preproc": tuple(vol_norm.shape),  # (1,Z,Y,X)
+    }
+    if seg_info is not None:
+        props.update(seg_info)
+
+    pkl_path = out_dir / f"{case_id}.pkl"
+    with open(pkl_path, "wb") as f:
         pickle.dump(props, f)
-    print(f"[INFO] Saved properties pkl: {prop_path}")
+    print(f"[OK] Saved pkl: {pkl_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_nrrd", type=str, required=True,
-                        help="原始 CT nrrd 文件")
-    parser.add_argument("--plans_json", type=str, required=True,
-                        help="LiTS nnUNetPlans.json 路径")
-    parser.add_argument("--case_id", type=str, required=True,
-                        help="保存时使用的 case_id（文件前缀）")
-    parser.add_argument("--out_dir", type=str, required=True,
-                        help="输出目录（会生成 case_id.b2nd / case_id.pkl 等）")
-    parser.add_argument("--seg_nrrd", type=str, default=None,
-                        help="可选：对应的分割 nrrd，用于生成 case_id_seg.b2nd")
-    parser.add_argument("--config", type=str, default="3d_fullres",
-                        help="使用的 nnUNet 配置（默认 3d_fullres）")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_nrrd", required=True)
+    ap.add_argument("--plans_json", required=True)
+    ap.add_argument("--case_id", required=True)
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--config", default="3d_fullres")
+    ap.add_argument("--seg_nrrd", default=None)
+    ap.add_argument("--no_ras", action="store_true", help="不做 RAS 重排（不推荐）")
+    args = ap.parse_args()
 
-    preprocess_to_b2nd(
+    preprocess_one_case(
         input_nrrd=args.input_nrrd,
         plans_json=args.plans_json,
         case_id=args.case_id,
         out_dir=args.out_dir,
-        seg_nrrd=args.seg_nrrd,
         config=args.config,
+        seg_nrrd=args.seg_nrrd,
+        force_ras=not args.no_ras,
     )
 
 

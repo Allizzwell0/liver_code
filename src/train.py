@@ -63,6 +63,31 @@ def dice_ce_loss(logits, target, num_classes=2, smooth=1e-5):
 
     return ce + dice_loss
 
+def dice_focal_loss(logits, target, alpha=0.75, gamma=2.0, smooth=1e-5):
+    """
+    Focal + Dice，用于肿瘤分割（类别极不均衡时更稳）。
+    logits: (B, C, Z, Y, X), C=2
+    target: (B, Z, Y, X)，值为 0/1
+    """
+    # ----- Focal part -----
+    # 普通 CE，先不做 mean，保留每个 voxel 的 loss
+    ce_voxel = F.cross_entropy(logits, target, reduction="none")  # (B,Z,Y,X)
+    pt = torch.exp(-ce_voxel)          # pt 越小，说明越难分
+    focal = (alpha * (1 - pt) ** gamma * ce_voxel).mean()
+
+    # ----- Dice part（和原来的一样） -----
+    num_classes = logits.shape[1]
+    probs = F.softmax(logits, dim=1)
+    target_oh = F.one_hot(target, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+
+    dims = (0, 2, 3, 4)
+    intersection = torch.sum(probs * target_oh, dims)
+    union = torch.sum(probs + target_oh, dims)
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    dice_loss = 1.0 - dice.mean()
+
+    return focal + dice_loss
+
 
 def foreground_dice(logits, target, smooth=1e-5):
     """
@@ -230,7 +255,14 @@ def main():
 
                 optimizer.zero_grad()
                 logits = model(imgs)
-                loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+
+                if args.stage == "tumor":
+                    # 肿瘤分割：Focal + Dice，更抗类不均衡
+                    loss = dice_focal_loss(logits, targets)
+                else:
+                    # 肝脏分割：原来的 CE + Dice 就够用了
+                    loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
                 optimizer.step()
@@ -238,6 +270,7 @@ def main():
                 train_loss += loss.item()
                 train_dice += foreground_dice(logits.detach(), targets)
                 n_train += 1
+
 
             train_loss /= max(1, n_train)
             train_dice /= max(1, n_train)
@@ -254,10 +287,15 @@ def main():
                     targets = targets.to(device, non_blocking=True)
                     logits = model(imgs)
 
-                    loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+                    if args.stage == "tumor":
+                        loss = dice_focal_loss(logits, targets)
+                    else:
+                        loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+
                     val_loss += loss.item()
                     val_dice += foreground_dice(logits, targets)
                     n_val += 1
+
 
             val_loss /= max(1, n_val)
             val_dice /= max(1, n_val)
