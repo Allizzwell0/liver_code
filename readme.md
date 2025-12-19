@@ -84,7 +84,7 @@ python eval_liver_full.py \
 python infer.py \
   --preproc_dir $PREPROC_DIR \
   --ckpt_liver /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like/liver_best.pth \
-  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor/tumor_best.pth \
+  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor_2/tumor_best.pth \
   --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data \
   --case_id Dataset003_Liver_0000
 
@@ -92,7 +92,7 @@ python infer.py \
 python infer.py \
   --preproc_dir $PREPROC_DIR \
   --ckpt_liver /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like/liver_best.pth \
-  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor/tumor_best.pth \
+  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor_2/tumor_best.pth \
   --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data
 ```
 
@@ -155,3 +155,19 @@ python export_nrrd.py \
 
 记录新编号与原编号关系：
 1-6 2-8 3-9 4-14
+
+新加脚本用于对比liver分割效果
+```bash
+
+PREPROC_DIR=/home/my/data/liver_data/nnUNet_data/preprocessed/Dataset003_Liver/nnUNetPlans_3d_fullres
+python compare.py \
+  --preproc_dir $PREPROC_DIR \
+  --ckpt train_logs/lits_3dfullres_like/liver_best.pth \
+  --out_dir /home/my/data/liver_data/eval_outputs/compare \
+  --split val \
+  --patch_size 128 128 128 \
+  --stride 64 64 64 \
+  --save_npy \
+  --run_totalseg \
+  --totalseg_fast
+```
