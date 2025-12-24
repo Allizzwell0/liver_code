@@ -4,6 +4,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class CoordConcat3D(nn.Module):
+    """
+    在 forward 时给输入拼上归一化坐标通道 (z,y,x) -> 3 channels
+    输出: (B, C+3, Z, Y, X)
+    """
+    def __init__(self, normalize: str = "minus1_1"):
+        super().__init__()
+        assert normalize in ["minus1_1", "0_1"]
+        self.normalize = normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,C,Z,Y,X)
+        B, C, Z, Y, X = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        if self.normalize == "minus1_1":
+            zz = torch.linspace(-1, 1, Z, device=device, dtype=dtype)
+            yy = torch.linspace(-1, 1, Y, device=device, dtype=dtype)
+            xx = torch.linspace(-1, 1, X, device=device, dtype=dtype)
+        else:
+            zz = torch.linspace(0, 1, Z, device=device, dtype=dtype)
+            yy = torch.linspace(0, 1, Y, device=device, dtype=dtype)
+            xx = torch.linspace(0, 1, X, device=device, dtype=dtype)
+
+        z, y, xg = torch.meshgrid(zz, yy, xx, indexing="ij")  # (Z,Y,X)
+        coords = torch.stack([z, y, xg], dim=0).unsqueeze(0).repeat(B, 1, 1, 1, 1)  # (B,3,Z,Y,X)
+        return torch.cat([x, coords], dim=1)
+
+
 class ConvBlock3d(nn.Module):
     """
     nnUNet-style 3D conv block:
@@ -107,8 +137,14 @@ class UNet3D(nn.Module):
         num_classes: int = 2,
         base_filters: int = 32,
         dropout_p: float = 0.0,
+        use_coords: bool = True, 
+        use_sdf_head: bool = True
     ):
         super().__init__()
+        self.use_coords = use_coords
+        self.use_sdf_head = use_sdf_head
+        self.coord = CoordConcat3D() if use_coords else nn.Identity()
+
 
         # 对应 nnUNet 3d_fullres 的 features_per_stage:
         # [32, 64, 128, 256, 320, 320]
@@ -122,7 +158,8 @@ class UNet3D(nn.Module):
 
         # encoder（6 个 stage）
         # strides: [1, 2, 2, 2, 2, 2]
-        self.enc0 = ConvBlock3d(in_channels, f0, first_stride=1)  # stage 0
+        first_in = in_channels + 3 if use_coords else in_channels
+        self.enc0 = ConvBlock3d(first_in, f0, first_stride=1)
         self.enc1 = ConvBlock3d(f0, f1, first_stride=2)           # stage 1
         self.enc2 = ConvBlock3d(f1, f2, first_stride=2)           # stage 2
         self.enc3 = ConvBlock3d(f2, f3, first_stride=2)           # stage 3
@@ -146,7 +183,12 @@ class UNet3D(nn.Module):
         # 最后 1x1x1 输出类别预测
         self.out_conv = nn.Conv3d(f0, num_classes, kernel_size=1)
 
+        # 额外：SDF 辅助头（见改动B）
+        self.sdf_head = nn.Conv3d(f0, 1, kernel_size=1) if use_sdf_head else None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        x = self.coord(x)   # 拼坐标通道
         # encoder path
         x0 = self.enc0(x)           # stage 0, full res
         x1 = self.enc1(x0)          # stage 1, 1/2
@@ -165,4 +207,13 @@ class UNet3D(nn.Module):
         y0 = self.up0(y1, x0)       # -> 对齐 stage 0 (full res)
 
         logits = self.out_conv(y0)  # (B, num_classes, Z, Y, X)
-        return logits
+        # if self.use_sdf_head:
+        #     sdf = self.sdf_head(y0)  # (B,1,Z,Y,X)
+        #     return logits, sdf
+        # return logits
+    
+        out = {"logits": logits}
+        if self.use_sdf_head:
+            out["sdf"] = self.sdf_head(y0)
+        return out
+

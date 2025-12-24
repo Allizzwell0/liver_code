@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-对 liver_best.pth 在整幅 3D 体积上做推理和 Dice 评估。
+对 liver_best.pth 在整幅 3D 体积上做推理和 Dice 评估（适配新版 UNet3D 输出 dict）。
 
 用法示例：
 
@@ -38,6 +38,22 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from models.unet3D import UNet3D
+
+
+# ----------------- 兼容新版/旧版输出 ----------------- #
+
+def get_logits(model_out):
+    """
+    兼容三种输出：
+      - 新版：dict {"logits": Tensor, "sdf": Tensor(optional)}
+      - 旧版：Tensor logits
+      - 旧版：tuple/list (logits, ...)
+    """
+    if isinstance(model_out, dict):
+        return model_out["logits"]
+    if isinstance(model_out, (tuple, list)):
+        return model_out[0]
+    return model_out
 
 
 # ----------------- 参数解析 ----------------- #
@@ -135,16 +151,14 @@ def list_case_ids(preproc_dir: Path, split: str, train_ratio: float, seed: int) 
 
 def load_case_b2nd(preproc_dir: Path, case_id: str):
     """
-    仿照 LITSDatasetB2ND._load_case_np:
-      - data_file: {case_id}.b2nd  -> img: (C, Z, Y, X)
-      - seg_file:  {case_id}_seg.b2nd -> seg: (Z, Y, X) or (1, Z, Y, X)
-    properties 目前不使用，但可以按需返回。
+    读取一个病例的 image / seg
+      - img: (C, Z, Y, X)
+      - seg: (Z, Y, X)
     """
     dparams = {"nthreads": 1}
 
     data_file = preproc_dir / f"{case_id}.b2nd"
     seg_file = preproc_dir / f"{case_id}_seg.b2nd"
-    prop_file = preproc_dir / f"{case_id}.pkl"
 
     if not data_file.is_file():
         raise FileNotFoundError(data_file)
@@ -158,12 +172,7 @@ def load_case_b2nd(preproc_dir: Path, case_id: str):
     seg = seg_b[:].astype(np.int16)     # (1, Z, Y, X) or (Z, Y, X)
 
     if seg.ndim == 4:
-        seg = seg[0]  # -> (Z, Y, X)
-
-    # 如果以后要用 spacing 等信息，可以在这里加载 properties
-    # import pickle as pkl
-    # with open(prop_file, "rb") as f:
-    #     properties = pkl.load(f)
+        seg = seg[0]
 
     return img, seg
 
@@ -171,7 +180,7 @@ def load_case_b2nd(preproc_dir: Path, case_id: str):
 # ----------------- 滑动窗口推理 ----------------- #
 
 def sliding_window_inference(
-    volume: torch.Tensor,
+    volume: torch.Tensor,                 # (1, C, Z, Y, X)
     model: torch.nn.Module,
     patch_size: Tuple[int, int, int],
     stride: Tuple[int, int, int],
@@ -209,8 +218,10 @@ def sliding_window_inference(
                     x1 = x0 + px
 
                     patch = volume[:, :, z0:z1, y0:y1, x0:x1]  # (1, C, pz, py, px)
-                    logits = model(patch)                      # (1, num_classes, pz, py, px)
-                    probs = F.softmax(logits, dim=1)[0]       # (num_classes, pz, py, px)
+
+                    out = model(patch)
+                    logits = get_logits(out)                    # (1, num_classes, pz, py, px)
+                    probs = F.softmax(logits, dim=1)[0]         # (num_classes, pz, py, px)
 
                     prob_map[:, z0:z1, y0:y1, x0:x1] += probs
                     weight_map[:, z0:z1, y0:y1, x0:x1] += 1.0
@@ -231,16 +242,13 @@ def dice_score(pred: np.ndarray, target: np.ndarray, smooth: float = 1e-5) -> fl
 
     intersection = (pred_fg * tgt_fg).sum()
     union = pred_fg.sum() + tgt_fg.sum()
-    dice = (2.0 * intersection + smooth) / (union + smooth)
-    return float(dice)
+    return float((2.0 * intersection + smooth) / (union + smooth))
 
 
 # ----------------- 主流程 ----------------- #
 
 def main():
     args = parse_args()
-
-    # 和你训练时一样，建议用单线程读取 blosc
     blosc2.set_nthreads(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,7 +258,7 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 加载 checkpoint，构建 UNet3D
+    # 1) 加载 checkpoint，构建 UNet3D（LIVER 新结构）
     ckpt = torch.load(args.ckpt, map_location=device)
     in_channels = ckpt.get("in_channels", 1)
     num_classes = ckpt.get("num_classes", 2)
@@ -258,13 +266,17 @@ def main():
     print(f"=> Loading model from {args.ckpt}")
     print(f"   in_channels={in_channels}, num_classes={num_classes}")
 
+    # liver: NEW model -> use_coords=True, use_sdf_head=True
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
-        base_filters=32,        # 要和训练时保持一致
+        base_filters=32,
         dropout_p=0.0,
+        use_coords=True,
+        use_sdf_head=True,
     ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+
+    model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
 
     patch_size = tuple(args.patch_size)
@@ -287,13 +299,12 @@ def main():
 
     # 3) 逐个 case 做整幅推理 + Dice
     for case_id in tqdm(case_ids, desc="Evaluating", unit="case"):
-        img_np, seg_np = load_case_b2nd(preproc_dir, case_id)   # img: (C,Z,Y,X), seg: (Z,Y,X)
+        img_np, seg_np = load_case_b2nd(preproc_dir, case_id)  # img:(C,Z,Y,X), seg:(Z,Y,X)
 
-        # liver 的 GT: seg>0 视为前景
+        # liver GT: seg>0 视为前景（肝+瘤）
         liver_gt = (seg_np > 0).astype(np.int16)
 
-        # 转 torch，增加 batch 维
-        vol = torch.from_numpy(img_np[None, ...]).to(device)  # (1, C, Z, Y, X)
+        vol = torch.from_numpy(img_np[None, ...]).to(device)  # (1,C,Z,Y,X)
 
         prob_map = sliding_window_inference(
             volume=vol,
@@ -301,14 +312,14 @@ def main():
             patch_size=patch_size,
             stride=stride,
             num_classes=num_classes,
-        )  # (num_classes, Z, Y, X)
+        )  # (num_classes,Z,Y,X)
 
         pred_label = prob_map.argmax(dim=0).cpu().numpy().astype(np.int16)  # (Z,Y,X)
 
-        dice = dice_score(pred_label, liver_gt)
-        dice_list.append(dice)
+        d = dice_score(pred_label, liver_gt)
+        dice_list.append(d)
 
-        print(f"  Case {case_id}: Dice={dice:.4f}")
+        print(f"  Case {case_id}: Dice={d:.4f}")
 
         if args.save_npy:
             np.save(out_dir / f"{case_id}_liver_pred.npy", pred_label)

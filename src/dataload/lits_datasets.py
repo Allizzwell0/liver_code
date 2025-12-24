@@ -7,6 +7,8 @@ import blosc2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+import SimpleITK as sitk
+
 
 
 class LITSDatasetB2ND(Dataset):
@@ -29,11 +31,17 @@ class LITSDatasetB2ND(Dataset):
         train: bool = True,
         train_ratio: float = 0.8,
         seed: int = 0,
+        return_sdf: bool = False, 
+        sdf_clip: float = 50.0, 
+        sdf_margin: int = 0
     ):
         assert stage in ("liver", "tumor")
         self.stage = stage
         self.patch_size = patch_size
         self.preproc_dir = Path(preproc_dir)
+        self.return_sdf = return_sdf
+        self.sdf_clip = float(sdf_clip)
+        self.sdf_margin = int(sdf_margin)
 
         # 所有病例的 id：用 .pkl 名称作为 case_id
         all_pkl = sorted(self.preproc_dir.glob("*.pkl"))
@@ -95,6 +103,39 @@ class LITSDatasetB2ND(Dataset):
             properties = pkl.load(f)
 
         return img, seg, properties
+    
+    # -------------------- 计算 SDF -------------------- #
+    @staticmethod
+    def _compute_sdf_from_binary(mask_zyx: np.ndarray, clip: float = 50.0, margin: int = 0) -> np.ndarray:
+        """
+        mask_zyx: (Z,Y,X) 0/1，前景=1
+        返回: sdf_zyx float32，范围约 [-1,1]，inside positive, outside negative
+        """
+        m = (mask_zyx > 0).astype(np.uint8)
+
+        # 可选：加 margin，减少 patch 边缘截断影响
+        if margin > 0:
+            m_pad = np.pad(m, ((margin, margin), (margin, margin), (margin, margin)), mode="constant")
+        else:
+            m_pad = m
+
+        img = sitk.GetImageFromArray(m_pad)  # SITK: array is (Z,Y,X)
+        # insideIsPositive=True => inside 为正；useImageSpacing=False => 按 voxel 距离
+        dist = sitk.SignedMaurerDistanceMap(
+            img, insideIsPositive=True, squaredDistance=False, useImageSpacing=False
+        )
+        sdf = sitk.GetArrayFromImage(dist).astype(np.float32)
+
+        # 去掉 margin
+        if margin > 0:
+            sdf = sdf[margin:-margin, margin:-margin, margin:-margin]
+
+        # 截断并归一化到 [-1,1]
+        if clip is not None and clip > 0:
+            sdf = np.clip(sdf, -clip, clip) / clip
+
+        return sdf
+
 
     # -------------------- 全图随机裁剪 -------------------- #
     @staticmethod
@@ -282,7 +323,17 @@ class LITSDatasetB2ND(Dataset):
         # 标签映射到 0/1
         tgt = self._remap_labels(seg)  # (Z, Y, X)
 
-        img_t = torch.from_numpy(img)        # (C, Z, Y, X), float32
-        tgt_t = torch.from_numpy(tgt).long() # (Z, Y, X),   int64
+        img_t = torch.from_numpy(img)              # (C,Z,Y,X) float32
+        tgt_t = torch.from_numpy(tgt).long()       # (Z,Y,X)   int64
 
-        return img_t, tgt_t, case_id
+        # ---- 新增：SDF ----
+        if self.return_sdf and self.stage == "liver":
+            sdf = self._compute_sdf_from_binary(tgt, clip=self.sdf_clip, margin=self.sdf_margin)  # (Z,Y,X)
+        else:
+            # tumor 或不开启 sdf：返回全 0，保证两任务接口一致
+            sdf = np.zeros_like(tgt, dtype=np.float32)
+
+        sdf_t = torch.from_numpy(sdf).float().unsqueeze(0)  # (1,Z,Y,X)
+
+        return img_t, tgt_t, sdf_t, case_id
+

@@ -105,6 +105,30 @@ def foreground_dice(logits, target, smooth=1e-5):
     return dice.item()
 
 
+def soft_dilate(p, k=5):
+    return F.max_pool3d(p, kernel_size=k, stride=1, padding=k//2)
+
+def soft_erode(p, k=5):
+    return -F.max_pool3d(-p, kernel_size=k, stride=1, padding=k//2)
+
+def soft_closing(p, k=5):
+    return soft_erode(soft_dilate(p, k=k), k=k)
+
+def unpack_out(out):
+    """
+    现在的 model 输出：dict {"logits":..., "sdf":...optional}
+    """
+    if isinstance(out, dict):
+        return out["logits"], out.get("sdf", None)
+    elif isinstance(out, (tuple, list)):
+        logits = out[0]
+        sdf = out[1] if len(out) > 1 else None
+        return logits, sdf
+    else:
+        return out, None
+
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -152,6 +176,8 @@ def main():
         train=True,
         train_ratio=args.train_ratio,
         seed=args.seed,
+        return_sdf=(args.stage=="liver"), 
+        sdf_margin=16
     )
     val_ds = LITSDatasetB2ND(
         preproc_dir=args.preproc_dir,
@@ -160,6 +186,8 @@ def main():
         train=False,
         train_ratio=args.train_ratio,
         seed=args.seed,
+        return_sdf=(args.stage=="liver"), 
+        sdf_margin=16
     )
 
     train_loader = DataLoader(
@@ -178,11 +206,20 @@ def main():
     )
 
     # 2) 用一个 batch 推断 in_channels
-    sample_imgs, _, _ = next(iter(train_loader))
+    sample_imgs, _, _, _ = next(iter(train_loader))
     in_channels = sample_imgs.shape[1]
     num_classes = 2
 
-    model = UNet3D(in_channels=in_channels, num_classes=num_classes, base_filters=32,dropout_p=0.0)
+    use_priors = (args.stage == "liver")
+    model = UNet3D(
+        in_channels=in_channels,
+        num_classes=num_classes,
+        base_filters=32,
+        dropout_p=0.0,
+        use_coords=use_priors,
+        use_sdf_head=use_priors,
+    )
+
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -249,19 +286,33 @@ def main():
             train_dice = 0.0
             n_train = 0
 
-            for imgs, targets, _ids in train_loader:
+            for imgs, targets, sdf_gt, _ids in train_loader:
                 imgs = imgs.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
+                sdf_gt = sdf_gt.to(device, non_blocking=True)
 
                 optimizer.zero_grad()
-                logits = model(imgs)
-
+                out = model(imgs)
+                logits, sdf_pred = unpack_out(out)
                 if args.stage == "tumor":
-                    # 肿瘤分割：Focal + Dice，更抗类不均衡
                     loss = dice_focal_loss(logits, targets)
                 else:
-                    # 肝脏分割：原来的 CE + Dice 就够用了
                     loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+
+                    # ---- 新增：liver 才加先验约束 ----
+                    # 1) 软 closing 约束
+                    prob = torch.softmax(logits, dim=1)[:, 1:2]     # (B,1,Z,Y,X)
+                    prob_close = soft_closing(prob, k=5)
+                    loss_hole = F.l1_loss(prob, prob_close)
+
+                    # 2) SDF 监督
+                    loss_sdf = 0.0
+                    if sdf_pred is not None:
+                        loss_sdf = F.l1_loss(torch.tanh(sdf_pred), sdf_gt)
+
+                    loss = loss + 0.05 * loss_hole + 0.2 * loss_sdf
+                    # loss = loss + 0.2 * loss_sdf
+
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
@@ -282,16 +333,19 @@ def main():
             n_val = 0
 
             with torch.no_grad():
-                for imgs, targets, _ids in val_loader:
+                for imgs, targets, sdf_gt, _ids in val_loader:
                     imgs = imgs.to(device, non_blocking=True)
                     targets = targets.to(device, non_blocking=True)
-                    logits = model(imgs)
+                    sdf_gt = sdf_gt.to(device, non_blocking=True)
+                    out = model(imgs)
+                    logits, sdf_pred = unpack_out(out)
 
                     if args.stage == "tumor":
                         loss = dice_focal_loss(logits, targets)
                     else:
                         loss = dice_ce_loss(logits, targets, num_classes=num_classes)
-
+                        # val 阶段一般不必加 sdf/hole 正则
+                        # 也可以加，但会让 val_loss 不再可比
                     val_loss += loss.item()
                     val_dice += foreground_dice(logits, targets)
                     n_val += 1
@@ -325,6 +379,9 @@ def main():
                 "in_channels": in_channels,
                 "num_classes": num_classes,
                 "patch_size": patch_size,
+                "use_coords": use_priors,
+                "use_sdf_head": use_priors,
+
             }
 
             # 每个 epoch 保存最近的 last checkpoint
@@ -350,6 +407,9 @@ def main():
             "in_channels": in_channels,
             "num_classes": num_classes,
             "patch_size": patch_size,
+            "use_coords": use_priors,
+            "use_sdf_head": use_priors,
+
         }
         interrupt_path = save_dir / f"{args.stage}_interrupt.pth"
         torch.save(interrupt_ckpt, interrupt_path)

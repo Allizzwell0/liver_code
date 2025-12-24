@@ -49,11 +49,11 @@ export CUDA_VISIBLE_DEVICES=1
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage liver \
-  --epochs 300 \
+  --epochs 1000 \
   --batch_size 2 \
   --patch_size 128 128 128 \
-  --save_dir train_logs/lits_3dfullres_like \
-  --resume train_logs/lits_3dfullres_like/liver_interrupt.pth 
+  --save_dir train_logs/lits_3dfullres_like_fix \
+  --resume train_logs/lits_3dfullres_like_fix/liver_interrupt.pth 
 
 # tumor 
 python train.py \
