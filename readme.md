@@ -167,7 +167,7 @@ python compare.py \
   --split val \
   --patch_size 128 128 128 \
   --stride 64 64 64 \
-  --save_npy \
-  --run_totalseg \
-  --totalseg_fast
+    --seed 0 \
+  --max_cases 10 \
+  --run_totalseg 
 ```
