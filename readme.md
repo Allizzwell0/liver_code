@@ -70,7 +70,7 @@ python train.py \
 ```bash
 python eval_liver_full.py \
   --preproc_dir $PREPROC_DIR \
-  --ckpt train_logs/lits_3dfullres_like/liver_best.pth \
+  --ckpt train_logs/lits_3dfullres_like_fix/liver_best.pth \
   --out_dir eval_liver_full_val \
   --split val \
   --patch_size 128 128 128 \
