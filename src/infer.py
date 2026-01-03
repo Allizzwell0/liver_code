@@ -1,40 +1,167 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Two-stage inference for LiTS (nnUNetv2 preprocessed .b2nd):
+Inference on nnUNetv2-preprocessed volumes (.b2nd) for LiTS / your own CT.
 
-Stage 1: liver segmentation (NEW weights, NEW model: use_coords=True, use_sdf_head=True)
-Stage 2: tumor segmentation within liver ROI (OLD weights, OLD model: use_coords=False, use_sdf_head=False)
+Supports robust liver cascade (recommended for LiTS->unlabeled CT transfer):
+- Coarse liver model (full volume, no priors/coords) -> coarse liver mask -> bbox
+- Refine liver model (ROI, ROI-global coords + priors optional) -> refined liver mask
 
-Outputs:
-  - <out_dir>/<case_id>_pred_liver.npy   (0/1) liver mask
-  - <out_dir>/<case_id>_pred_tumor.npy   (0/1) tumor mask
-  - <out_dir>/<case_id>_pred_3class.npy  (0/1/2) final label map
+Optional tumor model:
+- Tumor model runs within predicted liver ROI and outputs tumor mask.
 
-If GT seg exists (case_id_seg.b2nd), prints liver/tumor Dice.
+Outputs (.npy):
+  <out_dir>/<case_id>_pred_liver.npy   (0/1) liver
+  <out_dir>/<case_id>_pred_tumor.npy   (0/1) tumor (if --ckpt_tumor)
+  <out_dir>/<case_id>_pred_3class.npy  (0/1/2) final (if --ckpt_tumor)
+
+If GT seg exists (<case_id>_seg.b2nd), prints Dice.
 """
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, Optional, List
 
 import blosc2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from models.unet3D import UNet3D
 
 
-# ----------------- Utils ----------------- #
+# -------------------- I/O -------------------- #
 
-def get_logits(model_out: object) -> torch.Tensor:
-    """
-    Compatible with:
-      - NEW model: dict {"logits": Tensor, "sdf": Tensor(optional)}
-      - OLD model: Tensor logits
-      - OLD model: tuple/list (logits, ...)
-    """
+def load_b2nd(preproc_dir: Path, case_id: str):
+    dparams = {"nthreads": 1}
+    data_file = preproc_dir / f"{case_id}.b2nd"
+    if not data_file.is_file():
+        raise FileNotFoundError(data_file)
+    data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams=dparams)
+    img = data_b[:].astype(np.float32)  # (C,Z,Y,X)
+    return img
+
+
+def load_seg_if_exists(preproc_dir: Path, case_id: str) -> Optional[np.ndarray]:
+    dparams = {"nthreads": 1}
+    seg_file = preproc_dir / f"{case_id}_seg.b2nd"
+    if not seg_file.is_file():
+        return None
+    seg_b = blosc2.open(urlpath=str(seg_file), mode="r", dparams=dparams)
+    seg = seg_b[:].astype(np.int16)
+    if seg.ndim == 4:
+        seg = seg[0]
+    return seg
+
+
+def list_case_ids(preproc_dir: Path) -> List[str]:
+    pkls = sorted(preproc_dir.glob("*.pkl"))
+    if pkls:
+        return [p.stem for p in pkls]
+    b2 = sorted(preproc_dir.glob("*.b2nd"))
+    ids = []
+    for p in b2:
+        if p.name.endswith("_seg.b2nd"):
+            continue
+        ids.append(p.stem)
+    return ids
+
+
+# -------------------- coords / bbox / postprocess -------------------- #
+
+def make_coords_zyx(shape_zyx: Tuple[int, int, int]) -> np.ndarray:
+    Z, Y, X = shape_zyx
+    zz = np.linspace(-1.0, 1.0, Z, dtype=np.float32)[:, None, None]
+    yy = np.linspace(-1.0, 1.0, Y, dtype=np.float32)[None, :, None]
+    xx = np.linspace(-1.0, 1.0, X, dtype=np.float32)[None, None, :]
+    zc = np.broadcast_to(zz, (Z, Y, X))
+    yc = np.broadcast_to(yy, (Z, Y, X))
+    xc = np.broadcast_to(xx, (Z, Y, X))
+    return np.stack([zc, yc, xc], axis=0)  # (3,Z,Y,X)
+
+
+def add_coords_if_needed(img_czyx: np.ndarray, need_coords: bool) -> np.ndarray:
+    if not need_coords:
+        return img_czyx
+    coords = make_coords_zyx(img_czyx.shape[1:])  # (3,Z,Y,X)
+    return np.concatenate([img_czyx, coords], axis=0).astype(np.float32)
+
+
+def get_bbox_from_mask(mask_zyx: np.ndarray, margin: int = 16) -> Optional[Tuple[int, int, int, int, int, int]]:
+    zz, yy, xx = np.where(mask_zyx > 0)
+    if len(zz) == 0:
+        return None
+    z0, z1 = int(zz.min()), int(zz.max())
+    y0, y1 = int(yy.min()), int(yy.max())
+    x0, x1 = int(xx.min()), int(xx.max())
+    Z, Y, X = mask_zyx.shape
+    z0 = max(0, z0 - margin); z1 = min(Z - 1, z1 + margin)
+    y0 = max(0, y0 - margin); y1 = min(Y - 1, y1 + margin)
+    x0 = max(0, x0 - margin); x1 = min(X - 1, x1 + margin)
+    return z0, z1, y0, y1, x0, x1
+
+
+def crop_with_bbox(img_czyx: np.ndarray, bbox) -> np.ndarray:
+    z0, z1, y0, y1, x0, x1 = bbox
+    return img_czyx[:, z0:z1+1, y0:y1+1, x0:x1+1]
+
+
+def paste_roi(full_zyx: np.ndarray, roi_zyx: np.ndarray, bbox):
+    z0, z1, y0, y1, x0, x1 = bbox
+    full_zyx[z0:z1+1, y0:y1+1, x0:x1+1] = roi_zyx
+
+
+def _try_import_scipy():
+    try:
+        from scipy.ndimage import label as ndi_label, binary_fill_holes
+        return ndi_label, binary_fill_holes
+    except Exception:
+        return None, None
+
+
+def keep_largest_cc(mask_zyx: np.ndarray) -> np.ndarray:
+    ndi_label, _ = _try_import_scipy()
+    if ndi_label is None:
+        return mask_zyx.astype(np.uint8)
+    lab, n = ndi_label(mask_zyx.astype(np.uint8))
+    if n == 0:
+        return mask_zyx.astype(np.uint8)
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    return (lab == sizes.argmax()).astype(np.uint8)
+
+
+def fill_holes(mask_zyx: np.ndarray) -> np.ndarray:
+    _, binary_fill_holes = _try_import_scipy()
+    if binary_fill_holes is None:
+        return mask_zyx.astype(np.uint8)
+    return binary_fill_holes(mask_zyx.astype(bool)).astype(np.uint8)
+
+
+def postprocess_liver(mask01_zyx: np.ndarray) -> np.ndarray:
+    m = (mask01_zyx > 0).astype(np.uint8)
+    m = keep_largest_cc(m)
+    m = fill_holes(m)
+    m = keep_largest_cc(m)
+    return m
+
+
+# -------------------- sliding window -------------------- #
+
+def _hann_3d(patch_size: Tuple[int, int, int], device: torch.device) -> torch.Tensor:
+    """(1,1,pz,py,px) hann weight for smooth stitching."""
+    pz, py, px = patch_size
+    wz = torch.hann_window(pz, periodic=False, device=device).clamp_min(1e-3)
+    wy = torch.hann_window(py, periodic=False, device=device).clamp_min(1e-3)
+    wx = torch.hann_window(px, periodic=False, device=device).clamp_min(1e-3)
+    w = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+    return w[None, None, ...]
+
+
+def get_logits(model_out):
     if isinstance(model_out, dict):
         return model_out["logits"]
     if isinstance(model_out, (tuple, list)):
@@ -42,330 +169,248 @@ def get_logits(model_out: object) -> torch.Tensor:
     return model_out
 
 
-def load_case_np(preproc_dir: Path, case_id: str):
-    """
-    Read nnUNetv2 preprocessed case:
-      img: (C, Z, Y, X), float32
-      seg: (Z, Y, X), int16 if exists else None
-      properties: loaded from .pkl if exists else None
-    """
-    dparams = {"nthreads": 1}
-    img_file = preproc_dir / f"{case_id}.b2nd"
-    seg_file = preproc_dir / f"{case_id}_seg.b2nd"
-    prop_file = preproc_dir / f"{case_id}.pkl"
-
-    if not img_file.is_file():
-        raise FileNotFoundError(img_file)
-
-    img_b = blosc2.open(urlpath=str(img_file), mode="r", dparams=dparams)
-    img = img_b[:].astype(np.float32)  # (C,Z,Y,X)
-
-    seg = None
-    if seg_file.is_file():
-        seg_b = blosc2.open(urlpath=str(seg_file), mode="r", dparams=dparams)
-        seg_arr = seg_b[:].astype(np.int16)
-        if seg_arr.ndim == 4:
-            seg_arr = seg_arr[0]
-        seg = seg_arr  # (Z,Y,X)
-
-    properties = None
-    if prop_file.is_file():
-        import pickle as pkl
-        with open(prop_file, "rb") as f:
-            properties = pkl.load(f)
-
-    return img, seg, properties
-
-
-def binary_dice(pred: np.ndarray, target: np.ndarray, eps: float = 1e-5) -> float:
-    pred_fg = (pred > 0).astype(np.float32)
-    tgt_fg = (target > 0).astype(np.float32)
-    inter = np.sum(pred_fg * tgt_fg)
-    union = np.sum(pred_fg) + np.sum(tgt_fg)
-    return float((2 * inter + eps) / (union + eps))
-
-
-def get_liver_bbox_from_mask(mask: np.ndarray, margin: int = 10) -> Optional[Tuple[int, int, int, int, int, int]]:
-    liver_mask = mask > 0
-    if not liver_mask.any():
-        return None
-
-    zz, yy, xx = np.where(liver_mask)
-    z_min, z_max = int(zz.min()), int(zz.max())
-    y_min, y_max = int(yy.min()), int(yy.max())
-    x_min, x_max = int(xx.min()), int(xx.max())
-
-    Z, Y, X = mask.shape
-    z_min = max(0, z_min - margin)
-    y_min = max(0, y_min - margin)
-    x_min = max(0, x_min - margin)
-    z_max = min(Z - 1, z_max + margin)
-    y_max = min(Y - 1, y_max + margin)
-    x_max = min(X - 1, x_max + margin)
-
-    return z_min, z_max, y_min, y_max, x_min, x_max
-
-
-def make_sliding_windows(
-    Z: int, Y: int, X: int,
-    pz: int, py: int, px: int,
-    overlap: float = 0.5
-) -> List[Tuple[int, int, int]]:
-    assert 0 <= overlap < 1.0
-
-    def _starts(dim: int, p: int) -> List[int]:
-        if dim <= p:
-            return [0]
-        step = int(p * (1 - overlap))
-        step = max(1, step)
-        starts = list(range(0, dim - p + 1, step))
-        if starts[-1] != dim - p:
-            starts.append(dim - p)
-        return starts
-
-    z_starts = _starts(Z, pz)
-    y_starts = _starts(Y, py)
-    x_starts = _starts(X, px)
-
-    return [(z0, y0, x0) for z0 in z_starts for y0 in y_starts for x0 in x_starts]
-
-
-def sliding_window_predict(
-    img: np.ndarray,                 # (C,Z,Y,X)
+def sliding_window_prob(
+    volume: torch.Tensor,           # (1,C,Z,Y,X)
     model: torch.nn.Module,
-    device: torch.device,
     patch_size: Tuple[int, int, int],
-    num_classes: int,
-    batch_size: int = 1,
-    overlap: float = 0.5,
-) -> np.ndarray:
-    """
-    Sliding-window inference for a full volume.
-    Returns: pred (Z,Y,X) int64
-    """
+    stride: Tuple[int, int, int],
+    num_classes: int = 2,
+) -> torch.Tensor:
     model.eval()
-    C, Z, Y, X = img.shape
+    _, _, Z, Y, X = volume.shape
     pz, py, px = patch_size
+    sz, sy, sx = stride
+    device = volume.device
 
-    windows = make_sliding_windows(Z, Y, X, pz, py, px, overlap=overlap)
+    prob_map = torch.zeros((num_classes, Z, Y, X), dtype=torch.float32, device=device)
+    weight_map = torch.zeros((1, Z, Y, X), dtype=torch.float32, device=device)
 
-    prob_vol = np.zeros((num_classes, Z, Y, X), dtype=np.float32)
-    count_vol = np.zeros((1, Z, Y, X), dtype=np.float32)
+    w_patch = _hann_3d(patch_size, device=device)  # (1,1,pz,py,px)
+
+    z_starts = list(range(0, max(Z - pz + 1, 1), sz))
+    y_starts = list(range(0, max(Y - py + 1, 1), sy))
+    x_starts = list(range(0, max(X - px + 1, 1), sx))
+    if z_starts[-1] + pz < Z: z_starts.append(Z - pz)
+    if y_starts[-1] + py < Y: y_starts.append(Y - py)
+    if x_starts[-1] + px < X: x_starts.append(X - px)
 
     with torch.no_grad():
-        for i in range(0, len(windows), batch_size):
-            batch_windows = windows[i:i + batch_size]
-            batch_imgs = []
-            for (z0, y0, x0) in batch_windows:
-                patch = img[:, z0:z0+pz, y0:y0+py, x0:x0+px]
-                batch_imgs.append(patch)
+        for z0 in z_starts:
+            for y0 in y_starts:
+                for x0 in x_starts:
+                    z1, y1, x1 = z0 + pz, y0 + py, x0 + px
+                    patch = volume[:, :, z0:z1, y0:y1, x0:x1]
+                    out = model(patch)
+                    logits = get_logits(out)
+                    probs = F.softmax(logits, dim=1)  # (1,Cc,pz,py,px)
+                    prob_map[:, z0:z1, y0:y1, x0:x1] += (probs[0] * w_patch[0])
+                    weight_map[:, z0:z1, y0:y1, x0:x1] += w_patch[0, 0]
 
-            batch_arr = np.stack(batch_imgs, axis=0)  # (B,C,pz,py,px)
-            batch_tensor = torch.from_numpy(batch_arr).to(device=device, dtype=torch.float32)
-
-            out = model(batch_tensor)
-            logits = get_logits(out)  # (B,num_classes,pz,py,px)
-            probs = F.softmax(logits, dim=1).detach().cpu().numpy()
-
-            for b, (z0, y0, x0) in enumerate(batch_windows):
-                prob_vol[:, z0:z0+pz, y0:y0+py, x0:x0+px] += probs[b]
-                count_vol[:, z0:z0+pz, y0:y0+py, x0:x0+px] += 1.0
-
-    count_vol[count_vol == 0] = 1.0
-    prob_vol /= count_vol
-    pred = np.argmax(prob_vol, axis=0).astype(np.int64)
-    return pred
+    prob_map = prob_map / torch.clamp_min(weight_map, 1e-6)
+    return prob_map
 
 
-# ----------------- Model loading (NEW liver, OLD tumor) ----------------- #
+def maybe_tta_prob(
+    volume: torch.Tensor, model: torch.nn.Module, patch_size, stride, num_classes: int, tta: bool
+) -> torch.Tensor:
+    if not tta:
+        return sliding_window_prob(volume, model, patch_size, stride, num_classes=num_classes)
 
-def load_liver_model_new(ckpt_path: Path, device: torch.device) -> Tuple[torch.nn.Module, Tuple[int, int, int]]:
-    """
-    Liver uses NEW model structure: use_coords=True, use_sdf_head=True.
-    """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    in_channels = ckpt.get("in_channels", 1)
-    num_classes = ckpt.get("num_classes", 2)
-    patch_size = tuple(ckpt.get("patch_size", (128, 128, 128)))
+    # 8 flips over (Z,Y,X)
+    flips = [
+        (),
+        (2,),
+        (3,),
+        (4,),
+        (2, 3),
+        (2, 4),
+        (3, 4),
+        (2, 3, 4),
+    ]
+    probs_sum = None
+    for dims in flips:
+        v = volume
+        if dims:
+            v = torch.flip(v, dims=dims)
+        p = sliding_window_prob(v, model, patch_size, stride, num_classes=num_classes)
+        if dims:
+            p = torch.flip(p, dims=dims)
+        probs_sum = p if probs_sum is None else (probs_sum + p)
+    return probs_sum / float(len(flips))
+
+
+def dice_score(pred01: np.ndarray, gt01: np.ndarray, smooth: float = 1e-5) -> float:
+    p = (pred01 > 0).astype(np.float32)
+    g = (gt01 > 0).astype(np.float32)
+    inter = (p * g).sum()
+    union = p.sum() + g.sum()
+    return float((2.0 * inter + smooth) / (union + smooth))
+
+
+# -------------------- model loading -------------------- #
+
+def load_model(ckpt_path: Path, device: torch.device) -> Tuple[torch.nn.Module, dict]:
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+    in_channels = int(ckpt.get("in_channels", 1))
+    num_classes = int(ckpt.get("num_classes", 2))
+    use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+    use_se = bool(ckpt.get("use_se", False))
+    need_coords = bool(ckpt.get("add_coords", False))
 
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
         base_filters=32,
-        dropout_p=0.0,
-        use_coords=True,
-        use_sdf_head=True,
-    ).to(device)
-
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    model.eval()
-
-    print(f"[LIVER-NEW] Loaded {ckpt_path.name}: in_ch={in_channels}, classes={num_classes}, patch={patch_size}")
-    return model, patch_size
-
-
-def load_tumor_model_old(ckpt_path: Path, device: torch.device) -> Tuple[torch.nn.Module, Tuple[int, int, int]]:
-    """
-    Tumor uses OLD model structure: use_coords=False, use_sdf_head=False.
-    """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    in_channels = ckpt.get("in_channels", 1)
-    num_classes = ckpt.get("num_classes", 2)
-    patch_size = tuple(ckpt.get("patch_size", (128, 128, 128)))
-
-    model = UNet3D(
-        in_channels=in_channels,
-        num_classes=num_classes,
-        base_filters=32,
-        dropout_p=0.0,
+        dropout_p=float(ckpt.get("dropout_p", 0.0)),
+        use_sdf_head=use_sdf_head,
+        use_se=use_se,
         use_coords=False,
-        use_sdf_head=False,
     ).to(device)
-
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
-
-    print(f"[TUMOR-OLD] Loaded {ckpt_path.name}: in_ch={in_channels}, classes={num_classes}, patch={patch_size}")
-    return model, patch_size
-
-
-# ----------------- Two-stage inference ----------------- #
-
-def run_two_stage_inference_for_case(
-    preproc_dir: Path,
-    case_id: str,
-    liver_model: torch.nn.Module,
-    liver_patch_size: Tuple[int, int, int],
-    tumor_model: torch.nn.Module,
-    tumor_patch_size: Tuple[int, int, int],
-    device: torch.device,
-    out_dir: Path,
-    overlap: float = 0.5,
-    roi_margin: int = 10,
-):
-    print(f"\n===== Case: {case_id} =====")
-    img, seg, _ = load_case_np(preproc_dir, case_id)  # img: (C,Z,Y,X)
-    C, Z, Y, X = img.shape
-    print(f"[INFO] Image shape: C={C}, Z={Z}, Y={Y}, X={X}")
-
-    # ---- Stage 1: liver (NEW) ----
-    print("[Stage 1] Liver segmentation (NEW)...")
-    liver_pred = sliding_window_predict(
-        img=img,
-        model=liver_model,
-        device=device,
-        patch_size=liver_patch_size,
-        num_classes=2,
-        batch_size=1,
-        overlap=overlap,
-    )
-    liver_mask = (liver_pred == 1)
-
-    # ROI
-    bbox = get_liver_bbox_from_mask(liver_mask.astype(np.uint8), margin=roi_margin)
-    if bbox is None:
-        print("[WARN] Liver ROI not found -> run tumor on full volume.")
-        roi_zmin, roi_zmax = 0, Z - 1
-        roi_ymin, roi_ymax = 0, Y - 1
-        roi_xmin, roi_xmax = 0, X - 1
-    else:
-        roi_zmin, roi_zmax, roi_ymin, roi_ymax, roi_xmin, roi_xmax = bbox
-    print(f"[ROI] z:[{roi_zmin},{roi_zmax}] y:[{roi_ymin},{roi_ymax}] x:[{roi_xmin},{roi_xmax}]")
-
-    # ---- Stage 2: tumor (OLD) within ROI ----
-    print("[Stage 2] Tumor segmentation (OLD) within ROI...")
-    img_roi = img[:, roi_zmin:roi_zmax+1, roi_ymin:roi_ymax+1, roi_xmin:roi_xmax+1]
-
-    tumor_pred_roi = sliding_window_predict(
-        img=img_roi,
-        model=tumor_model,
-        device=device,
-        patch_size=tumor_patch_size,
-        num_classes=2,
-        batch_size=1,
-        overlap=overlap,
-    )
-
-    tumor_pred_full = np.zeros((Z, Y, X), dtype=np.int64)
-    tumor_pred_full[roi_zmin:roi_zmax+1, roi_ymin:roi_ymax+1, roi_xmin:roi_xmax+1] = tumor_pred_roi
-    tumor_mask = (tumor_pred_full == 1)
-
-    # ---- Compose 3-class ----
-    pred_3class = np.zeros((Z, Y, X), dtype=np.int16)
-    pred_3class[liver_mask] = 1
-    pred_3class[tumor_mask & liver_mask] = 2  # ensure tumor inside liver
-
-    # ---- Metrics if GT available ----
-    if seg is not None:
-        liver_gt = (seg >= 1)
-        tumor_gt = (seg == 2)
-
-        liver_dice = binary_dice(liver_mask.astype(np.uint8), liver_gt.astype(np.uint8))
-        tumor_dice = binary_dice(tumor_mask.astype(np.uint8), tumor_gt.astype(np.uint8))
-        print(f"[METRIC] Liver Dice = {liver_dice:.4f}")
-        print(f"[METRIC] Tumor Dice = {tumor_dice:.4f}")
-    else:
-        print("[INFO] No GT seg found, skip Dice.")
-
-    # ---- Save ----
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / f"{case_id}_pred_liver.npy", liver_mask.astype(np.uint8))
-    np.save(out_dir / f"{case_id}_pred_tumor.npy", tumor_mask.astype(np.uint8))
-    np.save(out_dir / f"{case_id}_pred_3class.npy", pred_3class)
-
-    print(f"[SAVE] {out_dir / (case_id + '_pred_liver.npy')}")
-    print(f"[SAVE] {out_dir / (case_id + '_pred_tumor.npy')}")
-    print(f"[SAVE] {out_dir / (case_id + '_pred_3class.npy')}")
+    meta = dict(ckpt)
+    meta["need_coords"] = need_coords
+    meta["patch_size"] = tuple(meta.get("patch_size", (128, 128, 128)))
+    meta["num_classes"] = num_classes
+    return model, meta
 
 
-# ----------------- CLI ----------------- #
+# -------------------- main -------------------- #
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--preproc_dir", type=str, required=True)
-    p.add_argument("--ckpt_liver", type=str, required=True, help="NEW liver ckpt")
-    p.add_argument("--ckpt_tumor", type=str, required=True, help="OLD tumor ckpt")
-    p.add_argument("--out_dir", type=str, required=True)
-    p.add_argument("--case_id", type=str, default=None)
-    p.add_argument("--overlap", type=float, default=0.5)
-    p.add_argument("--roi_margin", type=int, default=10)
-    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--out_dir", type=str, default="infer_out")
+    p.add_argument("--case_id", type=str, default=None, help="if None: run all cases in preproc_dir")
+
+    # liver ckpts
+    p.add_argument("--ckpt_liver", type=str, default=None, help="single-stage liver ckpt")
+    p.add_argument("--ckpt_coarse", type=str, default=None, help="coarse liver ckpt (full volume)")
+    p.add_argument("--ckpt_refine", type=str, default=None, help="refine liver ckpt (ROI)")
+
+    # tumor ckpt (optional)
+    p.add_argument("--ckpt_tumor", type=str, default=None)
+
+    # override inference params (otherwise read from ckpt)
+    p.add_argument("--patch_size", type=int, nargs=3, default=None)
+    p.add_argument("--stride", type=int, nargs=3, default=None)
+
+    p.add_argument("--bbox_margin", type=int, default=24)
+    p.add_argument("--tta", action="store_true")
+    p.add_argument("--save_prob", action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    blosc2.set_nthreads(1)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
     preproc_dir = Path(args.preproc_dir)
     out_dir = Path(args.out_dir)
-    ckpt_liver = Path(args.ckpt_liver)
-    ckpt_tumor = Path(args.ckpt_tumor)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    liver_model, liver_patch = load_liver_model_new(ckpt_liver, device)
-    tumor_model, tumor_patch = load_tumor_model_old(ckpt_tumor, device)
+    use_cascade = args.ckpt_coarse is not None and args.ckpt_refine is not None
+    if not use_cascade and args.ckpt_liver is None:
+        raise ValueError("Provide either --ckpt_liver (single-stage) or (--ckpt_coarse and --ckpt_refine) for cascade.")
 
-    if args.case_id is not None:
-        case_ids = [args.case_id]
+    if use_cascade:
+        model_coarse, meta_c = load_model(Path(args.ckpt_coarse), device)
+        model_refine, meta_r = load_model(Path(args.ckpt_refine), device)
     else:
-        all_pkl = sorted(preproc_dir.glob("*.pkl"))
-        case_ids = [p.stem for p in all_pkl]
-    print(f"[INFO] Will run inference for {len(case_ids)} case(s).")
+        model_liver, meta_l = load_model(Path(args.ckpt_liver), device)
 
-    for cid in case_ids:
-        run_two_stage_inference_for_case(
-            preproc_dir=preproc_dir,
-            case_id=cid,
-            liver_model=liver_model,
-            liver_patch_size=liver_patch,
-            tumor_model=tumor_model,
-            tumor_patch_size=tumor_patch,
-            device=device,
-            out_dir=out_dir,
-            overlap=args.overlap,
-            roi_margin=args.roi_margin,
-        )
+    model_tumor = None
+    meta_t = None
+    if args.ckpt_tumor:
+        model_tumor, meta_t = load_model(Path(args.ckpt_tumor), device)
+
+    case_ids = [args.case_id] if args.case_id else list_case_ids(preproc_dir)
+    print(f"Found {len(case_ids)} case(s).")
+
+    for case_id in tqdm(case_ids, desc="Infer", unit="case"):
+        img_np = load_b2nd(preproc_dir, case_id)  # (C,Z,Y,X)
+        seg_np = load_seg_if_exists(preproc_dir, case_id)  # (Z,Y,X) or None
+
+        # ---------- Liver ----------
+        if use_cascade:
+            img_c = add_coords_if_needed(img_np, meta_c["need_coords"])
+            vol = torch.from_numpy(img_c[None, ...]).to(device)
+            patch_size = tuple(args.patch_size) if args.patch_size else tuple(meta_c["patch_size"])
+            stride = tuple(args.stride) if args.stride else tuple(max(1, p // 2) for p in patch_size)
+            prob_c = maybe_tta_prob(vol, model_coarse, patch_size, stride, meta_c["num_classes"], args.tta)
+            pred_c = prob_c.argmax(dim=0).cpu().numpy().astype(np.uint8)
+            liver_c = postprocess_liver(pred_c)
+
+            bbox = get_bbox_from_mask(liver_c, margin=args.bbox_margin)
+            if bbox is None:
+                liver_pred = np.zeros_like(liver_c, dtype=np.uint8)
+            else:
+                img_roi = crop_with_bbox(img_np, bbox)
+                img_r = add_coords_if_needed(img_roi, meta_r["need_coords"])
+                vol_r = torch.from_numpy(img_r[None, ...]).to(device)
+
+                patch_size_r = tuple(args.patch_size) if args.patch_size else tuple(meta_r["patch_size"])
+                stride_r = tuple(args.stride) if args.stride else tuple(max(1, p // 2) for p in patch_size_r)
+                prob_r = maybe_tta_prob(vol_r, model_refine, patch_size_r, stride_r, meta_r["num_classes"], args.tta)
+                pred_r = prob_r.argmax(dim=0).cpu().numpy().astype(np.uint8)
+                liver_roi = postprocess_liver(pred_r)
+
+                liver_pred = np.zeros(img_np.shape[1:], dtype=np.uint8)  # (Z,Y,X)
+                paste_roi(liver_pred, liver_roi, bbox)
+                liver_pred = postprocess_liver(liver_pred)
+
+            if args.save_prob:
+                np.save(out_dir / f"{case_id}_prob_liver_coarse.npy", prob_c.cpu().numpy())
+        else:
+            img_l = add_coords_if_needed(img_np, meta_l["need_coords"])
+            vol = torch.from_numpy(img_l[None, ...]).to(device)
+            patch_size = tuple(args.patch_size) if args.patch_size else tuple(meta_l["patch_size"])
+            stride = tuple(args.stride) if args.stride else tuple(max(1, p // 2) for p in patch_size)
+            prob = maybe_tta_prob(vol, model_liver, patch_size, stride, meta_l["num_classes"], args.tta)
+            pred = prob.argmax(dim=0).cpu().numpy().astype(np.uint8)
+            liver_pred = postprocess_liver(pred)
+
+        np.save(out_dir / f"{case_id}_pred_liver.npy", liver_pred)
+
+        if seg_np is not None:
+            liver_gt = (seg_np >= 1).astype(np.uint8)
+            d = dice_score(liver_pred, liver_gt)
+            print(f"  {case_id} Liver Dice={d:.4f}")
+
+        # ---------- Tumor (optional) ----------
+        if model_tumor is not None:
+            bbox = get_bbox_from_mask(liver_pred, margin=10)
+            if bbox is None:
+                tumor_pred = np.zeros_like(liver_pred, dtype=np.uint8)
+            else:
+                img_roi = crop_with_bbox(img_np, bbox)
+                img_t = add_coords_if_needed(img_roi, meta_t["need_coords"])
+                vol_t = torch.from_numpy(img_t[None, ...]).to(device)
+
+                patch_size_t = tuple(args.patch_size) if args.patch_size else tuple(meta_t["patch_size"])
+                stride_t = tuple(args.stride) if args.stride else tuple(max(1, p // 2) for p in patch_size_t)
+                prob_t = maybe_tta_prob(vol_t, model_tumor, patch_size_t, stride_t, meta_t["num_classes"], args.tta)
+                pred_t = prob_t.argmax(dim=0).cpu().numpy().astype(np.uint8)
+
+                tumor_roi = (pred_t > 0).astype(np.uint8)
+                tumor_pred = np.zeros_like(liver_pred, dtype=np.uint8)
+                paste_roi(tumor_pred, tumor_roi, bbox)
+                tumor_pred = (tumor_pred & (liver_pred > 0)).astype(np.uint8)
+
+            np.save(out_dir / f"{case_id}_pred_tumor.npy", tumor_pred)
+
+            pred_3c = np.zeros_like(liver_pred, dtype=np.uint8)
+            pred_3c[liver_pred > 0] = 1
+            pred_3c[tumor_pred > 0] = 2
+            np.save(out_dir / f"{case_id}_pred_3class.npy", pred_3c)
+
+            if seg_np is not None:
+                tumor_gt = (seg_np == 2).astype(np.uint8)
+                d_t = dice_score(tumor_pred, tumor_gt)
+                print(f"  {case_id} Tumor Dice={d_t:.4f}")
 
 
 if __name__ == "__main__":

@@ -1,87 +1,121 @@
 # dataload/lits_datasets.py
+# -*- coding: utf-8 -*-
+"""
+Dataset for nnUNetv2-preprocessed LiTS (MSD Task03_Liver) stored as:
+  - <case_id>.b2nd        image (C,Z,Y,X) float32
+  - <case_id>_seg.b2nd    label (Z,Y,X) or (1,Z,Y,X) int16
+  - <case_id>.pkl         properties (only used for listing case ids)
+
+Key updates (to support LiTS->unlabeled CT transfer + fix prior issues):
+- Optional liver ROI sampling for liver stage (liver_use_bbox): coarse vs refine training.
+- Optional ROI-global coords channels (add_coords): coords are created on ROI/full volume first,
+  then patch is cropped from that ROI -> coords are consistent (NOT per-patch local coords).
+- Deterministic center-crop for val (train=False) for more stable model selection.
+- SDF target generation uses SimpleITK if available; otherwise falls back to scipy distance transform.
+"""
+
+from __future__ import annotations
+
 import random
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import blosc2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-import SimpleITK as sitk
 
+
+# ---- optional deps for SDF ----
+_HAS_SITK = False
+try:
+    import SimpleITK as sitk
+    _HAS_SITK = True
+except Exception:
+    sitk = None  # type: ignore
+
+_HAS_SCIPY = False
+try:
+    from scipy.ndimage import distance_transform_edt
+    _HAS_SCIPY = True
+except Exception:
+    distance_transform_edt = None  # type: ignore
+
+
+def _coords_zyx(shape_zyx: Tuple[int, int, int]) -> np.ndarray:
+    """Return (3,Z,Y,X) coords normalized to [-1,1] over the given volume."""
+    Z, Y, X = shape_zyx
+    zz = np.linspace(-1.0, 1.0, Z, dtype=np.float32)[:, None, None]
+    yy = np.linspace(-1.0, 1.0, Y, dtype=np.float32)[None, :, None]
+    xx = np.linspace(-1.0, 1.0, X, dtype=np.float32)[None, None, :]
+    zc = np.broadcast_to(zz, (Z, Y, X))
+    yc = np.broadcast_to(yy, (Z, Y, X))
+    xc = np.broadcast_to(xx, (Z, Y, X))
+    return np.stack([zc, yc, xc], axis=0)  # (3,Z,Y,X)
 
 
 class LITSDatasetB2ND(Dataset):
     """
-    使用 nnUNetv2 预处理后的 LiTS (MSD Task03_Liver) 数据 (.b2nd + .pkl)
+    stage="liver":  0=background, 1=liver (including tumor)
+    stage="tumor":  0=non-tumor,  1=tumor
 
-    - stage="liver":  背景 vs 肝脏(含肿瘤)，标签: 0 / 1
-    - stage="tumor":  背景/肝 vs 肿瘤，      标签: 0 / 1
-
-    肿瘤阶段 (stage="tumor")：
-        随机 patch 在『肝脏 ROI』内部采样，而不是整幅 volume 乱裁，
-        提高肿瘤样本比例，训练更稳定。
+    Tumor stage always samples inside liver ROI (from GT seg).
+    Liver stage can be coarse (full-volume sampling) or refine (liver ROI sampling).
     """
-
     def __init__(
         self,
         preproc_dir: str,
-        stage: str = "liver",           # "liver" or "tumor"
+        stage: str = "liver",
         patch_size: Tuple[int, int, int] = (96, 160, 160),
         train: bool = True,
         train_ratio: float = 0.8,
         seed: int = 0,
-        return_sdf: bool = False, 
-        sdf_clip: float = 50.0, 
-        sdf_margin: int = 0
+        return_sdf: bool = False,
+        sdf_clip: float = 20.0,
+        sdf_margin: int = 0,
+        liver_use_bbox: bool = False,
+        liver_bbox_margin: int = 16,
+        add_coords: bool = False,
+        tumor_bbox_margin: int = 10,
     ):
         assert stage in ("liver", "tumor")
         self.stage = stage
-        self.patch_size = patch_size
+        self.patch_size = tuple(int(x) for x in patch_size)
         self.preproc_dir = Path(preproc_dir)
-        self.return_sdf = return_sdf
+
+        self.train = bool(train)
+        self.return_sdf = bool(return_sdf)
         self.sdf_clip = float(sdf_clip)
         self.sdf_margin = int(sdf_margin)
 
-        # 所有病例的 id：用 .pkl 名称作为 case_id
+        self.liver_use_bbox = bool(liver_use_bbox)
+        self.liver_bbox_margin = int(liver_bbox_margin)
+        self.tumor_bbox_margin = int(tumor_bbox_margin)
+        self.add_coords = bool(add_coords)
+
         all_pkl = sorted(self.preproc_dir.glob("*.pkl"))
         case_ids = [p.stem for p in all_pkl]
-        if len(case_ids) == 0:
+        if not case_ids:
             raise RuntimeError(f"No .pkl files found in {preproc_dir}")
 
-        # 按病例划分 train / val
         rng = random.Random(seed)
         rng.shuffle(case_ids)
-        n_train = int(len(case_ids) * train_ratio)
-        if train:
-            self.case_ids = case_ids[:n_train]
-        else:
-            self.case_ids = case_ids[n_train:]
-
-        # 建议用 1 线程读取 blosc（nnUNet 里也有类似设置）
-        blosc2.set_nthreads(1)
+        n_train = int(len(case_ids) * float(train_ratio))
+        self.case_ids: List[str] = case_ids[:n_train] if self.train else case_ids[n_train:]
 
         print(
-            f"[LITSDatasetB2ND] stage={stage}, train={train}, "
-            f"num_cases={len(self.case_ids)}, patch_size={patch_size}"
+            f"[LITSDatasetB2ND] stage={stage}, train={self.train}, "
+            f"num_cases={len(self.case_ids)}, patch_size={self.patch_size}, "
+            f"liver_use_bbox={self.liver_use_bbox}, add_coords={self.add_coords}, return_sdf={self.return_sdf}"
         )
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.case_ids)
 
-    # -------------------- 读一个病例 -------------------- #
     def _load_case_np(self, case_id: str):
-        """
-        读取一个病例的 image / seg
-        返回:
-            img: float32, (C, Z, Y, X)
-            seg: int16,   (Z, Y, X)
-        """
         dparams = {"nthreads": 1}
-
         data_file = self.preproc_dir / f"{case_id}.b2nd"
         seg_file = self.preproc_dir / f"{case_id}_seg.b2nd"
-        prop_file = self.preproc_dir / f"{case_id}.pkl"
 
         if not data_file.is_file():
             raise FileNotFoundError(data_file)
@@ -91,249 +125,141 @@ class LITSDatasetB2ND(Dataset):
         data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams=dparams)
         seg_b = blosc2.open(urlpath=str(seg_file), mode="r", dparams=dparams)
 
-        img = data_b[:].astype(np.float32)  # (C, Z, Y, X)
-        seg = seg_b[:].astype(np.int16)     # (1, Z, Y, X) or (Z, Y, X)
-
+        img = data_b[:].astype(np.float32)  # (C,Z,Y,X)
+        seg = seg_b[:].astype(np.int16)
         if seg.ndim == 4:
             seg = seg[0]
+        return img, seg
 
-        # properties 先读出来备用（这里暂不使用）
-        import pickle as pkl
-        with open(prop_file, "rb") as f:
-            properties = pkl.load(f)
-
-        return img, seg, properties
-    
-    # -------------------- 计算 SDF -------------------- #
     @staticmethod
-    def _compute_sdf_from_binary(mask_zyx: np.ndarray, clip: float = 50.0, margin: int = 0) -> np.ndarray:
-        """
-        mask_zyx: (Z,Y,X) 0/1，前景=1
-        返回: sdf_zyx float32，范围约 [-1,1]，inside positive, outside negative
-        """
-        m = (mask_zyx > 0).astype(np.uint8)
+    def _remap_labels(seg_zyx: np.ndarray, stage: str) -> np.ndarray:
+        if stage == "liver":
+            return (seg_zyx >= 1).astype(np.int64)
+        return (seg_zyx == 2).astype(np.int64)
 
-        # 可选：加 margin，减少 patch 边缘截断影响
-        if margin > 0:
-            m_pad = np.pad(m, ((margin, margin), (margin, margin), (margin, margin)), mode="constant")
-        else:
-            m_pad = m
-
-        img = sitk.GetImageFromArray(m_pad)  # SITK: array is (Z,Y,X)
-        # insideIsPositive=True => inside 为正；useImageSpacing=False => 按 voxel 距离
-        dist = sitk.SignedMaurerDistanceMap(
-            img, insideIsPositive=True, squaredDistance=False, useImageSpacing=False
-        )
-        sdf = sitk.GetArrayFromImage(dist).astype(np.float32)
-
-        # 去掉 margin
-        if margin > 0:
-            sdf = sdf[margin:-margin, margin:-margin, margin:-margin]
-
-        # 截断并归一化到 [-1,1]
-        if clip is not None and clip > 0:
-            sdf = np.clip(sdf, -clip, clip) / clip
-
-        return sdf
-
-
-    # -------------------- 全图随机裁剪 -------------------- #
     @staticmethod
-    def _random_crop_with_padding(
-        img: np.ndarray,
-        seg: np.ndarray,
-        patch_size: Tuple[int, int, int],
-    ):
-        """
-        简单随机裁剪 + 正向 padding：
-        img: (C, Z, Y, X)
-        seg: (Z, Y, X)
-        """
-        _, Z, Y, X = img.shape
-        pz, py, px = patch_size
+    def _get_bbox_from_mask(mask_zyx: np.ndarray, margin: int = 0) -> Optional[Tuple[int, int, int, int, int, int]]:
+        zz, yy, xx = np.where(mask_zyx > 0)
+        if len(zz) == 0:
+            return None
+        z0, z1 = int(zz.min()), int(zz.max())
+        y0, y1 = int(yy.min()), int(yy.max())
+        x0, x1 = int(xx.min()), int(xx.max())
+        Z, Y, X = mask_zyx.shape
+        z0 = max(0, z0 - margin); z1 = min(Z - 1, z1 + margin)
+        y0 = max(0, y0 - margin); y1 = min(Y - 1, y1 + margin)
+        x0 = max(0, x0 - margin); x1 = min(X - 1, x1 + margin)
+        return z0, z1, y0, y1, x0, x1
 
+    @staticmethod
+    def _crop_zyx(img_czyx: np.ndarray, seg_zyx: np.ndarray, bbox) -> Tuple[np.ndarray, np.ndarray]:
+        z0, z1, y0, y1, x0, x1 = bbox
+        img = img_czyx[:, z0:z1+1, y0:y1+1, x0:x1+1]
+        seg = seg_zyx[z0:z1+1, y0:y1+1, x0:x1+1]
+        return img, seg
+
+    @staticmethod
+    def _pad_to_at_least(img_czyx: np.ndarray, seg_zyx: np.ndarray, target_zyx: Tuple[int, int, int]):
+        _, Z, Y, X = img_czyx.shape
+        pz, py, px = target_zyx
         pad_z = max(0, pz - Z)
         pad_y = max(0, py - Y)
         pad_x = max(0, px - X)
+        if pad_z or pad_y or pad_x:
+            img_czyx = np.pad(img_czyx, ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)), mode="constant")
+            seg_zyx = np.pad(seg_zyx, ((0, pad_z), (0, pad_y), (0, pad_x)), mode="constant")
+        return img_czyx, seg_zyx
 
-        if pad_z > 0 or pad_y > 0 or pad_x > 0:
-            img = np.pad(
-                img,
-                ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
-                mode="constant",
-            )
-            seg = np.pad(
-                seg,
-                ((0, pad_z), (0, pad_y), (0, pad_x)),
-                mode="constant",
-            )
-            _, Z, Y, X = img.shape
+    def _random_crop(self, img_czyx: np.ndarray, seg_zyx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        img_czyx, seg_zyx = self._pad_to_at_least(img_czyx, seg_zyx, self.patch_size)
+        _, Z, Y, X = img_czyx.shape
+        pz, py, px = self.patch_size
+        z0 = random.randint(0, max(0, Z - pz))
+        y0 = random.randint(0, max(0, Y - py))
+        x0 = random.randint(0, max(0, X - px))
+        return (
+            img_czyx[:, z0:z0+pz, y0:y0+py, x0:x0+px],
+            seg_zyx[z0:z0+pz, y0:y0+py, x0:x0+px],
+        )
 
-        max_z = Z - pz
-        max_y = Y - py
-        max_x = X - px
+    def _center_crop(self, img_czyx: np.ndarray, seg_zyx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        img_czyx, seg_zyx = self._pad_to_at_least(img_czyx, seg_zyx, self.patch_size)
+        _, Z, Y, X = img_czyx.shape
+        pz, py, px = self.patch_size
+        z0 = max(0, (Z - pz) // 2)
+        y0 = max(0, (Y - py) // 2)
+        x0 = max(0, (X - px) // 2)
+        return (
+            img_czyx[:, z0:z0+pz, y0:y0+py, x0:x0+px],
+            seg_zyx[z0:z0+pz, y0:y0+py, x0:x0+px],
+        )
 
-        z0 = np.random.randint(0, max_z + 1) if max_z > 0 else 0
-        y0 = np.random.randint(0, max_y + 1) if max_y > 0 else 0
-        x0 = np.random.randint(0, max_x + 1) if max_x > 0 else 0
-
-        img_patch = img[:, z0:z0+pz, y0:y0+py, x0:x0+px]
-        seg_patch = seg[z0:z0+pz, y0:y0+py, x0:x0+px]
-
-        return img_patch, seg_patch
-
-    # -------------------- 肝脏 ROI 包围盒 -------------------- #
     @staticmethod
-    def _get_liver_bbox(seg: np.ndarray, margin: int = 10) -> Optional[Tuple[int, int, int, int, int, int]]:
+    def _compute_sdf_from_binary(mask_zyx: np.ndarray, clip: float = 50.0, margin: int = 0) -> np.ndarray:
         """
-        从 seg 中提取肝脏 (seg>=1) 的 3D 包围盒，并加上一点 margin。
-        seg: (Z, Y, X)
-
-        返回:
-            z_min, z_max, y_min, y_max, x_min, x_max
-        若没有肝脏（极少见），返回 None。
+        Signed distance field in voxel units:
+          sdf > 0 inside foreground, sdf < 0 outside.
+        Output is clipped and normalized to ~[-1,1].
         """
-        liver_mask = seg >= 1          # 肝脏 + 肿瘤
-        if not liver_mask.any():
-            return None
+        m = (mask_zyx > 0).astype(np.uint8)
+        if margin > 0:
+            m = np.pad(m, ((margin, margin), (margin, margin), (margin, margin)), mode="constant")
 
-        zz, yy, xx = np.where(liver_mask)
-        z_min, z_max = int(zz.min()), int(zz.max())
-        y_min, y_max = int(yy.min()), int(yy.max())
-        x_min, x_max = int(xx.min()), int(xx.max())
-
-        # 加 margin 再裁剪到图像范围内
-        z_min = max(0, z_min - margin)
-        y_min = max(0, y_min - margin)
-        x_min = max(0, x_min - margin)
-
-        Z, Y, X = seg.shape
-        z_max = min(Z - 1, z_max + margin)
-        y_max = min(Y - 1, y_max + margin)
-        x_max = min(X - 1, x_max + margin)
-
-        return z_min, z_max, y_min, y_max, x_min, x_max
-
-    # -------------------- 肝脏 ROI 内随机裁剪 -------------------- #
-    @staticmethod
-    def _random_crop_in_roi(
-        img: np.ndarray,
-        seg: np.ndarray,
-        patch_size: Tuple[int, int, int],
-        roi_bbox: Tuple[int, int, int, int, int, int],
-    ):
-        """
-        在给定的 ROI 包围盒内部随机裁剪 patch。
-        img: (C, Z, Y, X)
-        seg: (Z, Y, X)
-        roi_bbox: (z_min, z_max, y_min, y_max, x_min, x_max)
-        """
-        (z_min, z_max, y_min, y_max, x_min, x_max) = roi_bbox
-        _, Z, Y, X = img.shape
-        pz, py, px = patch_size
-
-        # 1) 先看 ROI 自身是否比 patch 小，如是则整幅 pad
-        roi_Z = z_max - z_min + 1
-        roi_Y = y_max - y_min + 1
-        roi_X = x_max - x_min + 1
-
-        pad_z = max(0, pz - roi_Z)
-        pad_y = max(0, py - roi_Y)
-        pad_x = max(0, px - roi_X)
-
-        if pad_z > 0 or pad_y > 0 or pad_x > 0:
-            img = np.pad(
-                img,
-                ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)),
-                mode="constant",
-            )
-            seg = np.pad(
-                seg,
-                ((0, pad_z), (0, pad_y), (0, pad_x)),
-                mode="constant",
-            )
-            Z += pad_z
-            Y += pad_y
-            X += pad_x
-            z_max += pad_z
-            y_max += pad_y
-            x_max += pad_x
-
-        # 2) 在 ROI 内随机确定起点 (z0, y0, x0)
-        #   保证 patch 完全落在 [z_min, z_max] 等范围内
-        max_z0 = max(z_min, z_max - pz + 1)
-        max_y0 = max(y_min, y_max - py + 1)
-        max_x0 = max(x_min, x_max - px + 1)
-
-        if max_z0 <= z_min:
-            z0 = z_min
+        if _HAS_SITK:
+            img = sitk.GetImageFromArray(m)  # type: ignore
+            dist = sitk.SignedMaurerDistanceMap(img, insideIsPositive=True, squaredDistance=False, useImageSpacing=False)  # type: ignore
+            sdf = sitk.GetArrayFromImage(dist).astype(np.float32)  # type: ignore
         else:
-            z0 = np.random.randint(z_min, max_z0 + 1)
-
-        if max_y0 <= y_min:
-            y0 = y_min
-        else:
-            y0 = np.random.randint(y_min, max_y0 + 1)
-
-        if max_x0 <= x_min:
-            x0 = x_min
-        else:
-            x0 = np.random.randint(x_min, max_x0 + 1)
-
-        img_patch = img[:, z0:z0+pz, y0:y0+py, x0:x0+px]
-        seg_patch = seg[z0:z0+pz, y0:y0+py, x0:x0+px]
-
-        return img_patch, seg_patch
-
-    # -------------------- 标签重映射 -------------------- #
-    def _remap_labels(self, seg: np.ndarray) -> np.ndarray:
-        """
-        MSD Task03_Liver (LiTS) 标签约定:
-          0: 背景
-          1: 肝脏
-          2: 肿瘤
-
-        转二分类:
-          stage="liver":  0=背景, 1=肝脏(1或2)
-          stage="tumor":  0=非肿瘤, 1=肿瘤(=2)
-        """
-        if self.stage == "liver":
-            tgt = (seg >= 1).astype(np.int64)
-        else:
-            tgt = (seg == 2).astype(np.int64)
-        return tgt
-
-    # -------------------- 取一个样本 -------------------- #
-    def __getitem__(self, idx):
-        case_id = self.case_ids[idx]
-        img, seg, _ = self._load_case_np(case_id)
-
-        # === 关键逻辑：肿瘤阶段在肝脏 ROI 内采样 ===
-        if self.stage == "tumor":
-            bbox = self._get_liver_bbox(seg, margin=10)
-            if bbox is not None:
-                img, seg = self._random_crop_in_roi(img, seg, self.patch_size, bbox)
+            if not _HAS_SCIPY:
+                sdf = np.zeros_like(m, dtype=np.float32)
             else:
-                # 极少数没有肝脏标签的情况，退回到全图随机裁剪
-                img, seg = self._random_crop_with_padding(img, seg, self.patch_size)
+                inside = distance_transform_edt(m.astype(bool)).astype(np.float32)  # type: ignore
+                outside = distance_transform_edt((1 - m).astype(bool)).astype(np.float32)  # type: ignore
+                sdf = inside - outside
+
+        if margin > 0:
+            sdf = sdf[margin:-margin, margin:-margin, margin:-margin]
+
+        if clip is not None and clip > 0:
+            sdf = np.clip(sdf, -clip, clip) / clip
+        return sdf.astype(np.float32)
+
+    def __getitem__(self, idx: int):
+        case_id = self.case_ids[idx]
+        img, seg = self._load_case_np(case_id)     # img:(C,Z,Y,X), seg:(Z,Y,X)
+
+        # ---- ROI selection (before coords) ----
+        if self.stage == "tumor":
+            liver_mask = (seg >= 1).astype(np.uint8)
+            bbox = self._get_bbox_from_mask(liver_mask, margin=self.tumor_bbox_margin)
+            if bbox is not None:
+                img, seg = self._crop_zyx(img, seg, bbox)
+        elif self.stage == "liver" and self.liver_use_bbox:
+            liver_mask = (seg >= 1).astype(np.uint8)
+            bbox = self._get_bbox_from_mask(liver_mask, margin=self.liver_bbox_margin)
+            if bbox is not None:
+                img, seg = self._crop_zyx(img, seg, bbox)
+
+        # ---- coords on ROI/full volume (global in this ROI) ----
+        if self.add_coords:
+            coords = _coords_zyx(seg.shape).astype(np.float32)  # (3,Z,Y,X)
+            img = np.concatenate([img, coords], axis=0)
+
+        # ---- patch crop ----
+        if self.train:
+            img, seg = self._random_crop(img, seg)
         else:
-            # liver 阶段：整幅 volume 上随机采 patch（原逻辑不变）
-            img, seg = self._random_crop_with_padding(img, seg, self.patch_size)
+            img, seg = self._center_crop(img, seg)
 
-        # 标签映射到 0/1
-        tgt = self._remap_labels(seg)  # (Z, Y, X)
+        tgt = self._remap_labels(seg, self.stage)  # (Z,Y,X) 0/1
 
-        img_t = torch.from_numpy(img)              # (C,Z,Y,X) float32
-        tgt_t = torch.from_numpy(tgt).long()       # (Z,Y,X)   int64
+        img_t = torch.from_numpy(img).float()                # (C,Z,Y,X)
+        tgt_t = torch.from_numpy(tgt).long()                 # (Z,Y,X)
 
-        # ---- 新增：SDF ----
         if self.return_sdf and self.stage == "liver":
-            sdf = self._compute_sdf_from_binary(tgt, clip=self.sdf_clip, margin=self.sdf_margin)  # (Z,Y,X)
+            sdf = self._compute_sdf_from_binary(tgt, clip=self.sdf_clip, margin=self.sdf_margin)
         else:
-            # tumor 或不开启 sdf：返回全 0，保证两任务接口一致
             sdf = np.zeros_like(tgt, dtype=np.float32)
-
-        sdf_t = torch.from_numpy(sdf).float().unsqueeze(0)  # (1,Z,Y,X)
+        sdf_t = torch.from_numpy(sdf).float().unsqueeze(0)   # (1,Z,Y,X)
 
         return img_t, tgt_t, sdf_t, case_id
-

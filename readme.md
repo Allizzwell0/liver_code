@@ -44,16 +44,40 @@ export CUDA_VISIBLE_DEVICES=1
 训练脚本为src下的train.py
 可以终止，从last/best继续训练
 分为两阶段进行，先是liver，然后tumor
+新加bbox采样以及更改坐标输入方式（归一化后输入网络）
+
+改成三阶段，定位-精分-肿瘤
 ```bash
 # liver 最后一项是中断后可以重新加载权重
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage liver \
-  --epochs 1000 \
+  --save_dir train_logs/liver_coarse \
+  --epochs 200 \
   --batch_size 2 \
+  --lr 2e-4 \
+  --train_ratio 0.8 \
+  --seed 0 \
   --patch_size 128 128 128 \
-  --save_dir train_logs/lits_3dfullres_like_fix \
-  --resume train_logs/lits_3dfullres_like_fix/liver_interrupt.pth 
+  --use_priors 0 \
+  --liver_use_bbox 0 \
+  --resume train_logs/liver_coarse/liver_last.pth
+
+python train.py \
+  --preproc_dir $PREPROC_DIR \
+  --stage liver \
+  --save_dir train_logs/liver_refine \
+  --epochs 200 \
+  --batch_size 2 \
+  --lr 2e-4 \
+  --train_ratio 0.8 \
+  --seed 0 \
+  --patch_size 128 128 128 \
+  --use_priors 1 \
+  --liver_use_bbox 1 \
+  --liver_bbox_margin 16 \
+  --resume train_logs/liver_refine/liver_last.pth
+
 
 # tumor 
 python train.py \
@@ -61,21 +85,46 @@ python train.py \
   --stage tumor \
   --epochs 1000 \
   --batch_size 2 \
-  --patch_size 128 128 128 \
-  --save_dir train_logs/lits_3dfullres_like_tumor \
-  --resume train_logs/lits_3dfullres_like_tumor/tumor_best.pth
+  --lr 1e-3 \
+  --num_workers 4 \
+  --patch_size 96 160 160 \
+  --train_ratio 0.8 \
+  --save_dir train_logs/lits_tumor_bbox 
 ```
 
 训练时的eval是随机patch计算的，最后对模型进行完整的eval：
 ```bash
 python eval_liver_full.py \
   --preproc_dir $PREPROC_DIR \
-  --ckpt train_logs/lits_3dfullres_like_fix/liver_best.pth \
-  --out_dir eval_liver_full_val \
-  --split val \
-  --patch_size 128 128 128 \
-  --stride 64 64 64 \
+  --ckpt train_logs/liver_coarse/liver_best.pth \
+  --out_dir eval_coarse_val \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 128 128 128 --stride 64 64 64 \
   --save_npy
+
+# 完整liver
+python eval_liver_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --ckpt_refine train_logs/liver_refine/liver_best.pth \
+  --out_dir eval_cascade_val \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 128 128 128 --stride 64 64 64 \
+  --bbox_margin 24 \
+  --save_npy
+
+# 有label
+python eval_liver_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --ckpt_refine train_logs/liver_refine/liver_best.pth \
+  --out_dir eval_refine_gtbbox_val \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 128 128 128 --stride 64 64 64 \
+  --bbox_margin 24 \
+  --use_gt_bbox
+
+
 ```
 
 得到完整模型参数后，会进行两段式infer，输入为处理后的数据，输出为liver_mask, tumor_mask, 3class_mask
@@ -83,17 +132,23 @@ python eval_liver_full.py \
 # 单个推理
 python infer.py \
   --preproc_dir $PREPROC_DIR \
-  --ckpt_liver /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like/liver_best.pth \
-  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor_2/tumor_best.pth \
   --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data \
-  --case_id Dataset003_Liver_0000
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --ckpt_refine train_logs/liver_refine/liver_best.pth \
+  --ckpt_tumor train_logs/tumor/tumor_best.pth \
+  --bbox_margin 24 \
+  --tta
 
 # 全部测试
 python infer.py \
   --preproc_dir $PREPROC_DIR \
-  --ckpt_liver /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like/liver_best.pth \
-  --ckpt_tumor /home/my/liver/liver_code/src/train_logs/lits_3dfullres_like_tumor_2/tumor_best.pth \
-  --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data
+  --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data \
+    --case_id my_case003 \
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --ckpt_refine train_logs/liver_refine/liver_best.pth \
+  --ckpt_tumor train_logs/tumor/tumor_best.pth \
+  --bbox_margin 24 \
+  --tta
 ```
 
 查看训练曲线：
