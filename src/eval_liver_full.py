@@ -1,284 +1,325 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Evaluate liver segmentation on LiTS (.b2nd) with single or cascade liver model(s).
+Full-volume liver evaluation (Dice) on nnUNetv2-preprocessed LiTS (.b2nd).
 
-Examples:
-  # Single model
-  python eval_liver_full.py --preproc_dir <preproc> --ckpt_liver <ckpt> --split val
+Supports:
+- Single-stage:  --ckpt <liver_ckpt>
+- Cascade:       --ckpt_coarse <coarse_ckpt> --ckpt_refine <refine_ckpt>
+  (coarse -> bbox -> refine in ROI -> paste back)
 
-  # Cascade
-  python eval_liver_full.py --preproc_dir <preproc> --ckpt_coarse <coarse> --ckpt_refine <refine> --split val --bbox_margin 24
-
-Options:
-  --use_gt_bbox : refine stage uses GT liver bbox (upper bound; for debugging)
+This version is compatible with the provided UNet3D that can internally append coords
+(use_coords flag stored in checkpoint).
 """
 
 from __future__ import annotations
 
 import argparse
-import random
 from pathlib import Path
 from typing import Tuple, List, Optional
 
+import blosc2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import blosc2
+from tqdm import tqdm
 
 from models.unet3D import UNet3D
 
 
-def list_case_ids(preproc_dir: Path) -> List[str]:
-    # prefer .pkl existence to match train/val split; fallback to .b2nd
-    pkl = sorted(preproc_dir.glob("*.pkl"))
-    if pkl:
-        return [p.stem for p in pkl]
-    files = sorted(preproc_dir.glob("*.b2nd"))
-    ids = []
-    for f in files:
-        if f.name.endswith("_seg.b2nd"):
-            continue
-        ids.append(f.stem)
-    if not ids:
-        raise RuntimeError(f"No cases found in: {preproc_dir}")
-    return ids
+# ----------------- postprocess ----------------- #
+
+def _try_import_scipy():
+    try:
+        from scipy.ndimage import label as ndi_label, binary_fill_holes
+        return ndi_label, binary_fill_holes
+    except Exception:
+        return None, None
 
 
-def split_ids(ids: List[str], split: str, train_ratio: float, seed: int) -> List[str]:
-    ids = list(ids)
+def keep_largest_cc(mask: np.ndarray) -> np.ndarray:
+    ndi_label, _ = _try_import_scipy()
+    if ndi_label is None:
+        return mask.astype(np.uint8)
+    lab, n = ndi_label(mask.astype(np.uint8))
+    if n == 0:
+        return mask.astype(np.uint8)
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    return (lab == sizes.argmax()).astype(np.uint8)
+
+
+def fill_holes(mask: np.ndarray) -> np.ndarray:
+    _, binary_fill_holes = _try_import_scipy()
+    if binary_fill_holes is None:
+        return mask.astype(np.uint8)
+    return binary_fill_holes(mask.astype(bool)).astype(np.uint8)
+
+
+def postprocess_liver(mask01_zyx: np.ndarray) -> np.ndarray:
+    m = (mask01_zyx > 0).astype(np.uint8)
+    m = keep_largest_cc(m)
+    m = fill_holes(m)
+    m = keep_largest_cc(m)
+    return m
+
+
+def bbox_from_mask(mask: np.ndarray, margin: int) -> Optional[Tuple[int, int, int, int, int, int]]:
+    idx = np.where(mask > 0)
+    if idx[0].size == 0:
+        return None
+    z0, z1 = int(idx[0].min()), int(idx[0].max())
+    y0, y1 = int(idx[1].min()), int(idx[1].max())
+    x0, x1 = int(idx[2].min()), int(idx[2].max())
+    Z, Y, X = mask.shape
+    z0 = max(0, z0 - margin); z1 = min(Z - 1, z1 + margin)
+    y0 = max(0, y0 - margin); y1 = min(Y - 1, y1 + margin)
+    x0 = max(0, x0 - margin); x1 = min(X - 1, x1 + margin)
+    return z0, z1, y0, y1, x0, x1
+
+
+# ----------------- io ----------------- #
+
+def list_case_ids(preproc_dir: Path, split: str, train_ratio: float, seed: int) -> List[str]:
+    all_pkl = sorted(preproc_dir.glob("*.pkl"))
+    case_ids = [p.stem for p in all_pkl]
+    if not case_ids:
+        raise RuntimeError(f"No .pkl files found in {preproc_dir}")
+
+    import random
     rng = random.Random(seed)
-    rng.shuffle(ids)
-    n_train = int(len(ids) * float(train_ratio))
+    rng.shuffle(case_ids)
+    n_train = int(len(case_ids) * train_ratio)
+
+    if split == "all":
+        return case_ids
     if split == "train":
-        return ids[:n_train]
-    if split == "val":
-        return ids[n_train:]
-    return ids
+        return case_ids[:n_train]
+    return case_ids[n_train:]
 
 
-def load_b2nd(path: Path) -> np.ndarray:
+def load_case_b2nd(preproc_dir: Path, case_id: str):
     dparams = {"nthreads": 1}
-    b = blosc2.open(urlpath=str(path), mode="r", dparams=dparams)
-    return b[:]
+    data_file = preproc_dir / f"{case_id}.b2nd"
+    seg_file = preproc_dir / f"{case_id}_seg.b2nd"
+    if not data_file.is_file():
+        raise FileNotFoundError(data_file)
+    if not seg_file.is_file():
+        raise FileNotFoundError(seg_file)
 
+    data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams=dparams)
+    seg_b = blosc2.open(urlpath=str(seg_file), mode="r", dparams=dparams)
 
-def load_case(preproc_dir: Path, case_id: str):
-    img = load_b2nd(preproc_dir / f"{case_id}.b2nd").astype(np.float32)  # (C,Z,Y,X)
-    seg = load_b2nd(preproc_dir / f"{case_id}_seg.b2nd").astype(np.int16)
+    img = data_b[:].astype(np.float32)  # (C,Z,Y,X)
+    seg = seg_b[:].astype(np.int16)
     if seg.ndim == 4:
         seg = seg[0]
     return img, seg
 
 
-def bbox_from_mask(mask01: np.ndarray, margin: int = 0):
-    idx = np.argwhere(mask01 > 0)
-    if idx.size == 0:
-        return None
-    z0, y0, x0 = idx.min(axis=0).tolist()
-    z1, y1, x1 = idx.max(axis=0).tolist()
-    Z, Y, X = mask01.shape
-    z0 = max(0, z0 - margin)
-    y0 = max(0, y0 - margin)
-    x0 = max(0, x0 - margin)
-    z1 = min(Z - 1, z1 + margin)
-    y1 = min(Y - 1, y1 + margin)
-    x1 = min(X - 1, x1 + margin)
-    return int(z0), int(z1), int(y0), int(y1), int(x0), int(x1)
+# ----------------- model / sliding window ----------------- #
+
+def get_logits(model_out):
+    if isinstance(model_out, dict):
+        return model_out["logits"]
+    if isinstance(model_out, (tuple, list)):
+        return model_out[0]
+    return model_out
 
 
-def keep_largest_cc(mask01: np.ndarray) -> np.ndarray:
-    try:
-        import scipy.ndimage as ndi
-        lab, n = ndi.label(mask01.astype(np.uint8))
-        if n <= 1:
-            return mask01.astype(np.uint8)
-        sizes = ndi.sum(mask01.astype(np.uint8), lab, index=np.arange(1, n + 1))
-        k = int(np.argmax(sizes) + 1)
-        return (lab == k).astype(np.uint8)
-    except Exception:
-        return mask01.astype(np.uint8)
+def pad_to_min(volume: torch.Tensor, patch: Tuple[int, int, int]) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+    # volume: (1,C,Z,Y,X)
+    _, _, Z, Y, X = volume.shape
+    pz, py, px = patch
+    pad_z = max(0, pz - Z)
+    pad_y = max(0, py - Y)
+    pad_x = max(0, px - X)
+    if pad_z or pad_y or pad_x:
+        volume = F.pad(volume, (0, pad_x, 0, pad_y, 0, pad_z))
+    return volume, (Z, Y, X)
 
 
-def make_coords_zyx(shape_zyx: Tuple[int, int, int], device, dtype) -> torch.Tensor:
-    Z, Y, X = shape_zyx
-    zz = torch.linspace(-1, 1, Z, device=device, dtype=dtype)
-    yy = torch.linspace(-1, 1, Y, device=device, dtype=dtype)
-    xx = torch.linspace(-1, 1, X, device=device, dtype=dtype)
-    z, y, x = torch.meshgrid(zz, yy, xx, indexing="ij")
-    coords = torch.stack([z, y, x], dim=0)  # (3,Z,Y,X)
-    return coords
-
-
-def add_coords_if_needed(vol: torch.Tensor, need_coords: bool) -> torch.Tensor:
-    if not need_coords:
-        return vol
-    _, _, Z, Y, X = vol.shape
-    coords = make_coords_zyx((Z, Y, X), device=vol.device, dtype=vol.dtype).unsqueeze(0)
-    return torch.cat([vol, coords], dim=1)
-
-
-def _starts(dim: int, patch: int, stride: int) -> List[int]:
-    if dim <= patch:
-        return [0]
-    starts = list(range(0, dim - patch + 1, stride))
-    last = dim - patch
-    if starts[-1] != last:
-        starts.append(last)
-    return starts
-
-
-def hann_window_3d(patch_size: Tuple[int, int, int], device, dtype) -> torch.Tensor:
-    pz, py, px = patch_size
-    wz = torch.hann_window(pz, periodic=False, device=device, dtype=dtype)
-    wy = torch.hann_window(py, periodic=False, device=device, dtype=dtype)
-    wx = torch.hann_window(px, periodic=False, device=device, dtype=dtype)
-    w = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
-    w = w / (w.max().clamp_min(1e-6))
-    return w[None]  # (1,pz,py,px)
-
-
-@torch.no_grad()
 def sliding_window_prob(
-    vol_czyx: np.ndarray,
+    volume: torch.Tensor,  # (1,C,Z,Y,X)
     model: torch.nn.Module,
     patch_size: Tuple[int, int, int],
     stride: Tuple[int, int, int],
     num_classes: int,
-    need_coords: bool,
-    device: torch.device,
-) -> np.ndarray:
-    C, Z0, Y0, X0 = vol_czyx.shape
+) -> torch.Tensor:
+    model.eval()
+    volume, orig = pad_to_min(volume, patch_size)
+    _, _, Z, Y, X = volume.shape
     pz, py, px = patch_size
     sz, sy, sx = stride
 
-    pad_z = max(0, pz - Z0)
-    pad_y = max(0, py - Y0)
-    pad_x = max(0, px - X0)
-    if pad_z or pad_y or pad_x:
-        vol_czyx = np.pad(vol_czyx, ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)), mode="constant", constant_values=0)
+    prob = torch.zeros((num_classes, Z, Y, X), device=volume.device, dtype=torch.float32)
+    w = torch.zeros((1, Z, Y, X), device=volume.device, dtype=torch.float32)
 
-    _, Z, Y, X = vol_czyx.shape
-    prob_map = torch.zeros((num_classes, Z, Y, X), device=device, dtype=torch.float32)
-    wsum = torch.zeros((1, Z, Y, X), device=device, dtype=torch.float32)
-    w_patch = hann_window_3d(patch_size, device=device, dtype=torch.float32)
+    z_starts = list(range(0, max(Z - pz + 1, 1), sz))
+    y_starts = list(range(0, max(Y - py + 1, 1), sy))
+    x_starts = list(range(0, max(X - px + 1, 1), sx))
+    if z_starts[-1] + pz < Z: z_starts.append(Z - pz)
+    if y_starts[-1] + py < Y: y_starts.append(Y - py)
+    if x_starts[-1] + px < X: x_starts.append(X - px)
 
-    z_starts = _starts(Z, pz, sz)
-    y_starts = _starts(Y, py, sy)
-    x_starts = _starts(X, px, sx)
+    with torch.no_grad():
+        for z0 in z_starts:
+            for y0 in y_starts:
+                for x0 in x_starts:
+                    patch = volume[:, :, z0:z0+pz, y0:y0+py, x0:x0+px]
+                    logits = get_logits(model(patch))
+                    probs = torch.softmax(logits, dim=1)[0]  # (C,Z,Y,X)
+                    prob[:, z0:z0+pz, y0:y0+py, x0:x0+px] += probs
+                    w[:, z0:z0+pz, y0:y0+py, x0:x0+px] += 1.0
 
-    for z0 in z_starts:
-        for y0 in y_starts:
-            for x0 in x_starts:
-                patch = vol_czyx[:, z0:z0 + pz, y0:y0 + py, x0:x0 + px]
-                inp = torch.from_numpy(patch)[None].to(device=device, dtype=torch.float32)
-                inp = add_coords_if_needed(inp, need_coords)
-                out = model(inp)
-                logits = out["logits"] if isinstance(out, dict) else out
-                probs = torch.softmax(logits, dim=1)[0]
-                prob_map[:, z0:z0 + pz, y0:y0 + py, x0:x0 + px] += probs * w_patch
-                wsum[:, z0:z0 + pz, y0:y0 + py, x0:x0 + px] += w_patch
-
-    prob_map = prob_map / wsum.clamp_min(1e-6)
-    prob_map = prob_map[:, :Z0, :Y0, :X0]
-    return prob_map.detach().cpu().numpy().astype(np.float32)
+    prob = prob / torch.clamp_min(w, 1.0)
+    oZ, oY, oX = orig
+    return prob[:, :oZ, :oY, :oX]
 
 
-def load_model(ckpt_path: str, device: torch.device):
+def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, dict]:
     ckpt = torch.load(ckpt_path, map_location=device)
-    in_ch = int(ckpt.get("in_channels", 1))
+    in_channels = int(ckpt.get("in_channels", 1))
     num_classes = int(ckpt.get("num_classes", 2))
+    use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
-    use_se = bool(ckpt.get("use_se", False))
-    dropout_p = float(ckpt.get("dropout_p", 0.0))
-    need_coords = bool(ckpt.get("add_coords", False))
 
     model = UNet3D(
-        in_channels=in_ch,
+        in_channels=in_channels,
         num_classes=num_classes,
         base_filters=32,
-        dropout_p=dropout_p,
-        use_coords=False,
+        dropout_p=float(ckpt.get("dropout_p", 0.0)),
+        use_coords=use_coords,
         use_sdf_head=use_sdf_head,
-        use_se=use_se,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
-    return model, {"num_classes": num_classes, "need_coords": need_coords}
+    meta = {"in_channels": in_channels, "num_classes": num_classes, "use_coords": use_coords, "use_sdf_head": use_sdf_head}
+    return model, meta
 
+
+def dice_score(pred01: np.ndarray, gt01: np.ndarray, smooth: float = 1e-5) -> float:
+    pred = (pred01 > 0).astype(np.float32)
+    gt = (gt01 > 0).astype(np.float32)
+    inter = float((pred * gt).sum())
+    union = float(pred.sum() + gt.sum())
+    return float((2.0 * inter + smooth) / (union + smooth))
+
+
+# ----------------- main ----------------- #
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--preproc_dir", type=str, required=True)
 
-    p.add_argument("--ckpt_liver", type=str, default=None)
-    p.add_argument("--ckpt_coarse", type=str, default=None)
-    p.add_argument("--ckpt_refine", type=str, default=None)
+    p.add_argument("--ckpt", type=str, default=None, help="single-stage ckpt (optional)")
+    p.add_argument("--ckpt_coarse", type=str, default=None, help="cascade coarse ckpt")
+    p.add_argument("--ckpt_refine", type=str, default=None, help="cascade refine ckpt")
 
-    p.add_argument("--split", type=str, choices=["train", "val", "all"], default="val")
+    p.add_argument("--out_dir", type=str, default="eval_liver_full")
+    p.add_argument("--split", type=str, choices=["all", "train", "val"], default="val")
     p.add_argument("--train_ratio", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max_cases", type=int, default=-1)
 
     p.add_argument("--patch_size", type=int, nargs=3, default=[128, 128, 128])
     p.add_argument("--stride", type=int, nargs=3, default=[64, 64, 64])
-    p.add_argument("--bbox_margin", type=int, default=24)
-    p.add_argument("--use_gt_bbox", action="store_true")
+
+    p.add_argument("--bbox_margin", type=int, default=24, help="cascade: margin around coarse-pred bbox")
+    p.add_argument("--thr", type=float, default=0.5, help="binarize prob threshold")
+    p.add_argument("--use_gt_bbox", action="store_true", help="use GT liver bbox for refine (upper bound)")
+    p.add_argument("--save_npy", action="store_true")
     return p.parse_args()
-
-
-def dice01(pred01: np.ndarray, gt01: np.ndarray) -> float:
-    inter = float((pred01 * gt01).sum())
-    union = float(pred01.sum() + gt01.sum())
-    return float((2 * inter + 1e-5) / (union + 1e-5))
 
 
 def main():
     args = parse_args()
-    preproc_dir = Path(args.preproc_dir)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    patch_size = tuple(int(x) for x in args.patch_size)
-    stride = tuple(int(x) for x in args.stride)
+    blosc2.set_nthreads(1)
 
-    cascade = (args.ckpt_coarse is not None and args.ckpt_refine is not None)
-    if cascade:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    preproc_dir = Path(args.preproc_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    use_cascade = (args.ckpt_coarse is not None) and (args.ckpt_refine is not None)
+    if (not use_cascade) and (args.ckpt is None):
+        raise ValueError("Provide --ckpt (single) or --ckpt_coarse + --ckpt_refine (cascade).")
+
+    model_c = meta_c = model_r = meta_r = None
+    if use_cascade:
         model_c, meta_c = load_model(args.ckpt_coarse, device)
         model_r, meta_r = load_model(args.ckpt_refine, device)
+        print("=> Cascade mode")
+        print(f"   coarse={args.ckpt_coarse}")
+        print(f"   refine={args.ckpt_refine} (use_coords={meta_r['use_coords']})")
     else:
-        if args.ckpt_liver is None:
-            raise ValueError("Provide either --ckpt_liver OR (--ckpt_coarse and --ckpt_refine).")
-        model_s, meta_s = load_model(args.ckpt_liver, device)
+        model, meta = load_model(args.ckpt, device)
+        print("=> Single-stage mode")
+        print(f"   ckpt={args.ckpt} (use_coords={meta['use_coords']})")
 
-    ids = split_ids(list_case_ids(preproc_dir), args.split, args.train_ratio, args.seed)
-    print(f"[Eval] split={args.split} cases={len(ids)} device={device}")
+    patch_size = tuple(args.patch_size)
+    stride = tuple(args.stride)
 
-    dices = []
-    for cid in ids:
-        img_czyx, seg_zyx = load_case(preproc_dir, cid)
-        gt = (seg_zyx > 0).astype(np.uint8)
+    case_ids = list_case_ids(preproc_dir, args.split, args.train_ratio, args.seed)
+    if args.max_cases > 0:
+        case_ids = case_ids[: args.max_cases]
+    print(f"Found {len(case_ids)} case(s) for split='{args.split}'.")
 
-        if cascade:
-            prob_c = sliding_window_prob(img_czyx, model_c, patch_size, stride, meta_c["num_classes"], meta_c["need_coords"], device)
-            pred_c = (np.argmax(prob_c, axis=0) > 0).astype(np.uint8)
-            bb = bbox_from_mask(gt if args.use_gt_bbox else pred_c, margin=int(args.bbox_margin))
-            if bb is None:
-                pred = keep_largest_cc(pred_c)
+    dices: List[float] = []
+
+    for cid in tqdm(case_ids, desc="Eval-Liver", unit="case"):
+        img_np, seg_np = load_case_b2nd(preproc_dir, cid)
+        liver_gt = (seg_np > 0).astype(np.uint8)
+
+        if use_cascade:
+            vol = torch.from_numpy(img_np[None, ...]).to(device)
+            prob_c = sliding_window_prob(vol, model_c, patch_size, stride, num_classes=meta_c["num_classes"])
+            prob_liver_c = prob_c[1].detach().cpu().numpy()
+            liver_c = postprocess_liver((prob_liver_c > args.thr).astype(np.uint8))
+
+            if args.use_gt_bbox:
+                b = bbox_from_mask(liver_gt, margin=int(args.bbox_margin))
             else:
-                z0, z1, y0, y1, x0, x1 = bb
-                roi = img_czyx[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1]
-                prob_r_roi = sliding_window_prob(roi, model_r, patch_size, stride, meta_r["num_classes"], meta_r["need_coords"], device)
-                prob_r = np.zeros((2, *img_czyx.shape[1:]), dtype=np.float32)
-                prob_r[:, z0:z1 + 1, y0:y1 + 1, x0:x1 + 1] = prob_r_roi
-                pred = keep_largest_cc((np.argmax(prob_r, axis=0) > 0).astype(np.uint8))
+                b = bbox_from_mask(liver_c, margin=int(args.bbox_margin))
+
+            if b is None:
+                liver_pred = np.zeros_like(liver_gt, dtype=np.uint8)
+            else:
+                z0, z1, y0, y1, x0, x1 = b
+                img_roi = img_np[:, z0:z1+1, y0:y1+1, x0:x1+1]
+                vol_roi = torch.from_numpy(img_roi[None, ...]).to(device)
+                prob_r = sliding_window_prob(vol_roi, model_r, patch_size, stride, num_classes=meta_r["num_classes"])
+                prob_liver_r = prob_r[1].detach().cpu().numpy()
+
+                liver_pred = np.zeros_like(liver_gt, dtype=np.uint8)
+                liver_pred[z0:z1+1, y0:y1+1, x0:x1+1] = (prob_liver_r > args.thr).astype(np.uint8)
+                liver_pred = postprocess_liver(liver_pred)
         else:
-            prob = sliding_window_prob(img_czyx, model_s, patch_size, stride, meta_s["num_classes"], meta_s["need_coords"], device)
-            pred = keep_largest_cc((np.argmax(prob, axis=0) > 0).astype(np.uint8))
+            vol = torch.from_numpy(img_np[None, ...]).to(device)
+            prob = sliding_window_prob(vol, model, patch_size, stride, num_classes=meta["num_classes"])
+            prob_liver = prob[1].detach().cpu().numpy()
+            liver_pred = postprocess_liver((prob_liver > args.thr).astype(np.uint8))
 
-        d = dice01(pred, gt)
+        d = dice_score(liver_pred, liver_gt)
         dices.append(d)
-        print(f"{cid}: Dice={d:.4f}")
+        print(f"  {cid}: Dice={d:.4f}")
 
-    if dices:
-        print(f"Mean Dice = {float(np.mean(dices)):.4f} ± {float(np.std(dices)):.4f}")
+        if args.save_npy:
+            np.save(out_dir / f"{cid}_liver_pred.npy", liver_pred.astype(np.uint8))
+            np.save(out_dir / f"{cid}_liver_gt.npy", liver_gt.astype(np.uint8))
+
+    dices_np = np.array(dices, dtype=np.float32)
+    print("=" * 60)
+    print(f"[Liver Dice] split={args.split} cases={len(dices)}")
+    print(f"  Mean={float(dices_np.mean()):.4f}  Std={float(dices_np.std()):.4f}")
+    print("=" * 60)
+
+    with (out_dir / "liver_eval_results.txt").open("w") as f:
+        for cid, d in zip(case_ids, dices):
+            f.write(f"{cid}\t{d:.6f}\n")
+        f.write(f"\nMean\t{float(dices_np.mean()):.6f}\nStd\t{float(dices_np.std()):.6f}\n")
 
 
 if __name__ == "__main__":
