@@ -53,102 +53,200 @@ python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage liver \
   --save_dir train_logs/liver_coarse \
-  --epochs 200 \
+  --epochs 500 \
   --batch_size 2 \
   --lr 2e-4 \
+  --num_workers 4 \
+  --patch_size 128 128 128 \
   --train_ratio 0.8 \
   --seed 0 \
-  --patch_size 128 128 128 \
-  --use_priors 0 \
   --liver_use_bbox 0 \
   --resume train_logs/liver_coarse/liver_last.pth
 
+
+# 第二阶段准备
+python infer.py \
+  --preproc_dir $PREPROC_DIR \
+  --out_dir train_logs/liver_coarse/pred_liver \
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --bbox_margin 24 \
+  --save_prob
+
+# 常规训练 GT
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage liver \
   --save_dir train_logs/liver_refine \
-  --epochs 200 \
+  --epochs 500 \
   --batch_size 2 \
   --lr 2e-4 \
+  --num_workers 4 \
+  --patch_size 128 128 128 \
   --train_ratio 0.8 \
   --seed 0 \
-  --patch_size 128 128 128 \
-  --use_priors 1 \
   --liver_use_bbox 1 \
   --liver_bbox_margin 16 \
   --resume train_logs/liver_refine/liver_last.pth
+
+
+# 一阶段结果加入
+python train.py \
+  --preproc_dir $PREPROC_DIR \
+  --stage liver \
+  --save_dir train_logs/liver_refine \
+  --epochs 1000 \
+  --batch_size 2 \
+  --lr 2e-4 \
+  --num_workers 4 \
+  --patch_size 128 128 128 \
+  --train_ratio 0.8 \
+  --seed 0 \
+  --liver_use_bbox 1 \
+  --liver_bbox_margin 16 \
+  --liver_use_pred_bbox 1 \
+  --liver_pred_dir train_logs/liver_coarse/pred_liver \
+  --resume train_logs/liver_refine/liver_last.pth
+
+
+
+
+# tumor之前使用自训网络进行liver裁剪
+python infer.py \
+  --preproc_dir $PREPROC_DIR \
+  --out_dir train_logs/pred_liver_for_tumor \
+  --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
+  --ckpt_refine train_logs/liver_refine/liver_best.pth \
+  --bbox_margin 24 \
+  --save_prob
+
 
 
 # tumor 
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage tumor \
+  --save_dir train_logs/lits_tumor_bbox \
   --epochs 1000 \
   --batch_size 2 \
   --lr 1e-3 \
   --num_workers 4 \
   --patch_size 96 160 160 \
   --train_ratio 0.8 \
-  --save_dir train_logs/lits_tumor_bbox 
+  --seed 0 \
+  --tumor_use_pred_liver 1 \
+  --tumor_pred_liver_dir train_logs/pred_liver_for_tumor \
+  --tumor_pred_bbox_ratio 0.5 \
+  --tumor_add_liver_prior 1 \
+  --tumor_prior_type prob \
+  --tumor_bbox_margin 24 \
+  --tumor_pos_ratio 0.6 \
+  --tumor_hardneg_ratio 0.3 \
+  --tumor_alpha 0.75 \
+  --tumor_gamma 2.0 \
+  --resume train_logs/lits_tumor_bbox/tumor_last.pth
+
+
 ```
 
 训练时的eval是随机patch计算的，最后对模型进行完整的eval：
 ```bash
+# 仅评估liver_coarse
 python eval_liver_full.py \
   --preproc_dir $PREPROC_DIR \
   --ckpt train_logs/liver_coarse/liver_best.pth \
-  --out_dir eval_coarse_val \
+  --out_dir /home/my/data/liver_data/eval_outputs/liver_coarse_val \
   --split val --train_ratio 0.8 --seed 0 \
   --patch_size 128 128 128 --stride 64 64 64 \
-  --save_npy
+  --thr 0.5
 
-# 完整liver
+# 评估liver-cascade
 python eval_liver_full.py \
   --preproc_dir $PREPROC_DIR \
   --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
   --ckpt_refine train_logs/liver_refine/liver_best.pth \
-  --out_dir eval_cascade_val \
+  --out_dir /home/my/data/liver_data/eval_outputs/liver_cascade_val \
   --split val --train_ratio 0.8 --seed 0 \
   --patch_size 128 128 128 --stride 64 64 64 \
   --bbox_margin 24 \
-  --save_npy
+  --thr 0.5
 
-# 有label
+# 评估liver-refine上限
 python eval_liver_full.py \
   --preproc_dir $PREPROC_DIR \
   --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
   --ckpt_refine train_logs/liver_refine/liver_best.pth \
-  --out_dir eval_refine_gtbbox_val \
+  --out_dir /home/my/data/liver_data/eval_outputs/liver_refine_gtbbox_val \
   --split val --train_ratio 0.8 --seed 0 \
   --patch_size 128 128 128 --stride 64 64 64 \
   --bbox_margin 24 \
-  --use_gt_bbox
-
+  --use_gt_bbox \
+  --thr 0.5
 
 ```
 
 得到完整模型参数后，会进行两段式infer，输入为处理后的数据，输出为liver_mask, tumor_mask, 3class_mask
 ```bash
-# 单个推理
+# 有标注时，先进行裁剪，在进行tumor分割
 python infer.py \
   --preproc_dir $PREPROC_DIR \
-  --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data \
+  --out_dir /home/my/data/liver_data/eval_outputs/pred_liver_for_tumor_val \
   --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
   --ckpt_refine train_logs/liver_refine/liver_best.pth \
-  --ckpt_tumor train_logs/tumor/tumor_best.pth \
   --bbox_margin 24 \
-  --tta
+  --save_prob
 
-# 全部测试
-python infer.py \
+python eval_tumor_full.py \
   --preproc_dir $PREPROC_DIR \
-  --out_dir /home/my/data/liver_data/eval_outputs/LiTS_data \
-    --case_id my_case003 \
+  --liver_dir /home/my/data/liver_data/eval_outputs/pred_liver_for_tumor_val \
+  --ckpt_tumor train_logs/lits_tumor_bbox/tumor_best.pth \
+  --out_dir /home/my/data/liver_data/eval_outputs/tumor_val \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 96 160 160 --stride 48 80 80 \
+  --bbox_margin 24 \
+  --thr 0.5 \
+  --min_cc 5
+
+# GT数据测上限
+python eval_tumor_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --liver_dir /home/my/data/liver_data/eval_outputs/pred_liver_for_tumor_val \
+  --ckpt_tumor train_logs/lits_tumor_bbox/tumor_best.pth \
+  --out_dir /home/my/data/liver_data/eval_outputs/tumor_val_gtbbox \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 96 160 160 --stride 48 80 80 \
+  --bbox_margin 24 \
+  --use_gt_liver_bbox \
+  --thr 0.5 \
+  --min_cc 20
+
+# 无标注时过程类似
+python infer.py \
+  --preproc_dir $MY_PREPROC_DIR \
+  --out_dir /home/my/data/liver_data/my_eval_outs/pred_liver \
   --ckpt_coarse train_logs/liver_coarse/liver_best.pth \
   --ckpt_refine train_logs/liver_refine/liver_best.pth \
-  --ckpt_tumor train_logs/tumor/tumor_best.pth \
   --bbox_margin 24 \
-  --tta
+  --save_prob
+
+python infer_tumor_full.py \
+  --preproc_dir $MY_PREPROC_DIR \
+  --out_dir /home/my/data/liver_data/my_eval_outs/pred_tumor \
+  --ckpt_tumor train_logs/lits_tumor_bbox/tumor_best.pth \
+  --liver_dir /home/my/data/liver_data/my_eval_outs/pred_liver \
+  --patch_size 96 160 160 --stride 48 80 80 \
+  --bbox_margin 24 \
+  --thr 0.5 \
+  --min_cc 20 \
+  --save_prob \
+  --save_seg
+
+# 无label的分割体素统计
+python eval_unlabeled_qc.py \
+  --pred_liver_dir /home/my/data/liver_data/my_eval_outs/pred_liver \
+  --pred_tumor_dir /home/my/data/liver_data/my_eval_outs/pred_tumor \
+  --out_csv /home/my/data/liver_data/my_eval_outs/qc_summary.csv
+
+
 ```
 
 查看训练曲线：
@@ -202,9 +300,9 @@ PREPROC_DIR=//home/my/data/liver_data/self_data/prepocessed_data
 ```bash
 python export_nrrd.py \
     --orig_ct /home/my/data/liver_data/self_data/RAS_CT/6_RAS.nrrd \
-    --seg_npy /home/my/data/liver_data/eval_outputs/my_data/my_case001_pred_3class.npy \
+    --seg_npy /home/my/data/liver_data/my_eval_outs/pred_tumor/my_case001_pred_seg.npy \
     --spacing 1.0 0.767578125 0.767578125 \
-    --out_seg /home/my/data/liver_data/self_data/slicer/my_case001_seg_on_orig.nrrd \
+    --out_seg /home/my/data/liver_data/my_eval_outs/slicer/my_case001_seg_on_orig.nrrd \
     --flip_z
 ```
 
