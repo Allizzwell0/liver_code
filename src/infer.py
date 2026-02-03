@@ -177,6 +177,7 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     num_classes = int(ckpt.get("num_classes", 2))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+    use_attn_gate = bool(ckpt.get("use_attn_gate", False))
 
     model = UNet3D(
         in_channels=in_channels,
@@ -185,10 +186,11 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
         dropout_p=0.0,
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
+        use_attn_gate=use_attn_gate,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
-    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head)
+    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head, use_attn_gate=use_attn_gate)
     return model, meta
 
 

@@ -129,6 +129,7 @@ class LITSDatasetB2ND(Dataset):
         self.preproc_dir = Path(preproc_dir)
         self.stage = stage
         assert stage in ["liver", "tumor"]
+        self.train = bool(train)
         self.patch_size = tuple(patch_size)
         self.return_sdf = bool(return_sdf) and (stage == "liver")
         self.sdf_clip = float(sdf_clip)
@@ -246,6 +247,35 @@ class LITSDatasetB2ND(Dataset):
             sdf = np.clip(sdf, -clip, clip) / clip
         return sdf
 
+    # --------- light data augmentation (no extra deps) ---------
+    def _augment_patch(self, img_czyx: np.ndarray, seg_zyx: np.ndarray, strong: bool = False):
+        """Augment a cropped patch (numpy).
+
+        - flips: always enabled
+        - intensity/noise: only when strong=True (recommended for tumor)
+        """
+        # random flips on spatial axes (Z,Y,X)
+        if np.random.rand() < 0.5:
+            img_czyx = img_czyx[:, ::-1, :, :]
+            seg_zyx = seg_zyx[::-1, :, :]
+        if np.random.rand() < 0.5:
+            img_czyx = img_czyx[:, :, ::-1, :]
+            seg_zyx = seg_zyx[:, ::-1, :]
+        if np.random.rand() < 0.5:
+            img_czyx = img_czyx[:, :, :, ::-1]
+            seg_zyx = seg_zyx[:, :, ::-1]
+
+        if strong:
+            # mild scale/shift (assumes input already normalized by preprocessing)
+            scale = np.random.uniform(0.9, 1.1)
+            shift = np.random.uniform(-0.1, 0.1)
+            img_czyx = img_czyx * scale + shift
+            # gaussian noise
+            if np.random.rand() < 0.5:
+                img_czyx = img_czyx + np.random.normal(0.0, 0.03, size=img_czyx.shape).astype(np.float32)
+
+        return img_czyx, seg_zyx
+
     def _random_crop_in_bbox(self, img: np.ndarray, seg: np.ndarray, bbox: Tuple[int, int, int, int, int, int]):
         """Random crop fully inside bbox (or best-effort if bbox smaller)."""
         _, Z, Y, X = img.shape
@@ -298,8 +328,6 @@ class LITSDatasetB2ND(Dataset):
             else:
                 img_p, seg_p, start = self._random_crop_full(img, seg)
 
-            target = (seg_p > 0).astype(np.int64)
-
             # optional: append pred prior channel (mask)
             if self.liver_add_pred_prior:
                 if pred_liver is None:
@@ -313,6 +341,12 @@ class LITSDatasetB2ND(Dataset):
                 pz, py, px = self.patch_size
                 prior_p = prior[z0:z0+pz, y0:y0+py, x0:x0+px].astype(np.float32)[None, ...]
                 img_p = np.concatenate([img_p, prior_p], axis=0)
+
+            # augment (train only). liver: flips only
+            if self.train:
+                img_p, seg_p = self._augment_patch(img_p, seg_p, strong=False)
+
+            target = (seg_p > 0).astype(np.int64)
 
             if self.return_sdf:
                 sdf = self._compute_sdf(target.astype(np.uint8), clip=self.sdf_clip)
@@ -395,9 +429,6 @@ class LITSDatasetB2ND(Dataset):
         else:
             img_p, seg_p = self._crop_by_start(img, seg, start)
 
-        # tumor label: 2 -> 1, else 0
-        target = (seg_p == 2).astype(np.int64)
-
         # optional: append liver prior channel
         if self.tumor_add_liver_prior:
             prior = None
@@ -415,6 +446,13 @@ class LITSDatasetB2ND(Dataset):
             zz, yy, xx = start
             prior_p = prior[zz:zz+pz, yy:yy+py, xx:xx+px][None, ...].astype(np.float32)
             img_p = np.concatenate([img_p, prior_p], axis=0)
+
+        # augment (train only). tumor: flips + mild intensity/noise
+        if self.train:
+            img_p, seg_p = self._augment_patch(img_p, seg_p, strong=True)
+
+        # tumor label: 2 -> 1, else 0
+        target = (seg_p == 2).astype(np.int64)
 
         sdf = np.zeros((1,) + self.patch_size, dtype=np.float32)
         return (

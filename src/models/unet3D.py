@@ -60,6 +60,38 @@ class ConvBlock3d(nn.Module):
         return x
 
 
+class AttentionGate3D(nn.Module):
+    """Attention gate for 3D skip connections (Attention U-Net style).
+
+    Inputs:
+      x: skip feature map (B, F_l, Z,Y,X)
+      g: gating feature map (B, F_g, Z,Y,X)  (usually decoder feature after upsample)
+
+    Output:
+      attended skip feature map with same shape as x.
+    """
+    def __init__(self, g_ch: int, x_ch: int, inter_ch: int):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv3d(g_ch, inter_ch, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(inter_ch, eps=1e-5, affine=True),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv3d(x_ch, inter_ch, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(inter_ch, eps=1e-5, affine=True),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv3d(inter_ch, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.LeakyReLU(0.01, inplace=True)
+
+    def forward(self, x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        # x: skip, g: gate (same spatial size)
+        a = self.relu(self.W_x(x) + self.W_g(g))
+        alpha = self.psi(a)  # (B,1,Z,Y,X)
+        return x * alpha
+
 class UpBlock3d(nn.Module):
     """
     上采样 + 拼接 skip + ConvBlock3d
@@ -69,9 +101,10 @@ class UpBlock3d(nn.Module):
       skip_ch : skip connection 的通道数
       out_ch  : 当前 stage 的输出通道数
     """
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, use_attn_gate: bool = False):
         super().__init__()
         self.up = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2)
+        self.attn = AttentionGate3D(g_ch=out_ch, x_ch=skip_ch, inter_ch=max(out_ch // 2, 8)) if use_attn_gate else None
         self.conv = ConvBlock3d(in_ch=out_ch + skip_ch, out_ch=out_ch, first_stride=1)
 
     @staticmethod
@@ -113,6 +146,8 @@ class UpBlock3d(nn.Module):
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         x = self._pad_or_crop_to_match(x, skip)
+        if self.attn is not None:
+            skip = self.attn(skip, x)
         x = torch.cat([skip, x], dim=1)
         x = self.conv(x)
         return x
@@ -132,10 +167,12 @@ class UNet3D(nn.Module):
         dropout_p: float = 0.0,
         use_coords: bool = True,
         use_sdf_head: bool = True,
+        use_attn_gate: bool = False,
     ):
         super().__init__()
         self.use_coords = use_coords
         self.use_sdf_head = use_sdf_head
+        self.use_attn_gate = use_attn_gate
         self.coord = CoordConcat3D() if use_coords else nn.Identity()
 
         f0 = base_filters
@@ -156,11 +193,11 @@ class UNet3D(nn.Module):
 
         self.bottom_dropout = nn.Dropout3d(p=dropout_p) if dropout_p > 0 else nn.Identity()
 
-        self.up4 = UpBlock3d(in_ch=f5, skip_ch=f4, out_ch=f4)
-        self.up3 = UpBlock3d(in_ch=f4, skip_ch=f3, out_ch=f3)
-        self.up2 = UpBlock3d(in_ch=f3, skip_ch=f2, out_ch=f2)
-        self.up1 = UpBlock3d(in_ch=f2, skip_ch=f1, out_ch=f1)
-        self.up0 = UpBlock3d(in_ch=f1, skip_ch=f0, out_ch=f0)
+        self.up4 = UpBlock3d(in_ch=f5, skip_ch=f4, out_ch=f4, use_attn_gate=use_attn_gate)
+        self.up3 = UpBlock3d(in_ch=f4, skip_ch=f3, out_ch=f3, use_attn_gate=use_attn_gate)
+        self.up2 = UpBlock3d(in_ch=f3, skip_ch=f2, out_ch=f2, use_attn_gate=use_attn_gate)
+        self.up1 = UpBlock3d(in_ch=f2, skip_ch=f1, out_ch=f1, use_attn_gate=use_attn_gate)
+        self.up0 = UpBlock3d(in_ch=f1, skip_ch=f0, out_ch=f0, use_attn_gate=use_attn_gate)
 
         self.out_conv = nn.Conv3d(f0, num_classes, kernel_size=1)
         self.sdf_head = nn.Conv3d(f0, 1, kernel_size=1) if use_sdf_head else None

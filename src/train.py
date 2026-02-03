@@ -57,6 +57,30 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0
     return focal + (1.0 - dice.mean())
 
 
+def focal_tversky_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.75,
+    gamma: float = 1.33,
+    smooth: float = 1e-5,
+) -> torch.Tensor:
+    """Focal Tversky (binary foreground) + CE.
+
+    - alpha: weight for FP term; (1-alpha) weights FN term
+    - gamma: focal exponent on (1 - tversky)
+    This is often more stable than pure dice for tiny tumors.
+    """
+    ce = F.cross_entropy(logits, target)
+    probs = torch.softmax(logits, dim=1)[:, 1]  # (B,Z,Y,X)
+    tgt = (target == 1).float()
+    dims = (1, 2, 3)
+    tp = (probs * tgt).sum(dims)
+    fp = (probs * (1 - tgt)).sum(dims)
+    fn = ((1 - probs) * tgt).sum(dims)
+    tversky = (tp + smooth) / (tp + alpha * fp + (1 - alpha) * fn + smooth)
+    loss_tv = (1.0 - tversky).clamp_min(0.0).pow(gamma).mean()
+    return ce + loss_tv
+
 def foreground_dice(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> float:
     preds = torch.argmax(logits, dim=1)
     pred_fg = (preds == 1).float()
@@ -134,6 +158,8 @@ def parse_args():
 
     # 可选：用上一阶段权重初始化（不带 optimizer）
     p.add_argument("--pretrained", type=str, default=None)
+    p.add_argument("--use_attn_gate", type=int, default=0, choices=[0, 1], help="use AttentionGate on skip connections (recommended for tumor)")
+
 
     # --------- liver bbox 采样开关（0/1）---------
     p.add_argument("--liver_use_bbox", type=int, default=1, choices=[0, 1])
@@ -160,6 +186,8 @@ def parse_args():
     # tumor focal 超参
     p.add_argument("--tumor_alpha", type=float, default=0.75)
     p.add_argument("--tumor_gamma", type=float, default=2.0)
+    p.add_argument("--tumor_loss", type=str, default="focal_tversky", choices=["focal_dice", "focal_tversky"])
+
 
     return p.parse_args()
 
@@ -252,6 +280,7 @@ def main():
         dropout_p=0.0,
         use_coords=use_priors,
         use_sdf_head=use_priors,
+        use_attn_gate=bool(args.use_attn_gate),
     ).to(device)
 
     if args.pretrained and (args.resume is None):
@@ -306,6 +335,7 @@ def main():
             "patch_size": tuple(patch_size),
             "use_coords": bool(use_priors),
             "use_sdf_head": bool(use_priors),
+            "use_attn_gate": bool(args.use_attn_gate),
             # liver
             "liver_use_bbox": bool(liver_use_bbox),
             "liver_bbox_margin": int(args.liver_bbox_margin),
@@ -323,6 +353,7 @@ def main():
             "tumor_hardneg_ratio": float(args.tumor_hardneg_ratio),
             "tumor_alpha": float(args.tumor_alpha),
             "tumor_gamma": float(args.tumor_gamma),
+            "tumor_loss": str(args.tumor_loss),
         }
 
     current_epoch = start_epoch - 1
@@ -346,7 +377,9 @@ def main():
                 logits, sdf_pred = unpack_out(out)
 
                 if args.stage == "tumor":
-                    loss = dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+                    loss = (dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+                            if args.tumor_loss == "focal_dice"
+                            else focal_tversky_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma)))
                 else:
                     loss = dice_ce_loss(logits, targets, num_classes=num_classes)
                     if use_priors:
@@ -384,7 +417,9 @@ def main():
                     logits, sdf_pred = unpack_out(out)
 
                     if args.stage == "tumor":
-                        loss = dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+                        loss = (dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+                            if args.tumor_loss == "focal_dice"
+                            else focal_tversky_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma)))
                     else:
                         loss = dice_ce_loss(logits, targets, num_classes=num_classes)
                         if use_priors:
