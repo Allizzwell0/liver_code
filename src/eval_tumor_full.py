@@ -86,6 +86,67 @@ def remove_small_cc(mask: np.ndarray, min_size: int = 20) -> np.ndarray:
     return out
 
 
+
+
+def postprocess_tumor_mask(
+    prob_tumor_zyx: np.ndarray,
+    liver_roi_zyx: np.ndarray,
+    thr: float = 0.5,
+    min_cc: int = 20,
+    cc_min_mean_prob: float = 0.0,
+    filter_tubular: bool = True,
+    tubular_aspect: float = 10.0,
+    tubular_thickness: int = 3,
+) -> np.ndarray:
+    """
+    Tumor postprocess inside liver ROI:
+      1) thr -> binary
+      2) mask *= liver_roi
+      3) remove small CC
+      4) (optional) remove low-mean-prob CC
+      5) (optional) remove thin & elongated CC (duct-like)
+    """
+    mask = (prob_tumor_zyx > float(thr)).astype(np.uint8)
+    mask = (mask * (liver_roi_zyx > 0).astype(np.uint8)).astype(np.uint8)
+    mask = remove_small_cc(mask, min_size=int(min_cc))
+
+    if (cc_min_mean_prob > 0) or filter_tubular:
+        try:
+            from scipy.ndimage import label as ndi_label
+        except Exception:
+            return mask
+
+        lab, n = ndi_label(mask.astype(np.uint8))
+        if n <= 0:
+            return mask
+
+        keep = np.zeros(n + 1, dtype=np.uint8)
+        keep[0] = 0
+        for k in range(1, n + 1):
+            comp = (lab == k)
+            if comp.sum() == 0:
+                continue
+
+            if cc_min_mean_prob > 0:
+                mp = float(prob_tumor_zyx[comp].mean())
+                if mp < float(cc_min_mean_prob):
+                    continue
+
+            if filter_tubular:
+                zs, ys, xs = np.where(comp)
+                dz = int(zs.max() - zs.min() + 1)
+                dy = int(ys.max() - ys.min() + 1)
+                dx = int(xs.max() - xs.min() + 1)
+                th = min(dz, dy, dx)
+                asp = max(dz, dy, dx) / max(1, th)
+                if (th <= int(tubular_thickness)) and (asp >= float(tubular_aspect)):
+                    continue
+
+            keep[k] = 1
+
+        return (keep[lab] > 0).astype(np.uint8)
+
+    return mask
 def bbox_from_mask(mask: np.ndarray, margin: int) -> Optional[Tuple[int, int, int, int, int, int]]:
     idx = np.where(mask > 0)
     if idx[0].size == 0:
@@ -200,24 +261,38 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     ckpt = torch.load(ckpt_path, map_location=device)
     in_channels = int(ckpt.get("in_channels", 1))
     num_classes = int(ckpt.get("num_classes", 2))
+    base_filters = int(ckpt.get("base_filters", 32))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
     use_attn_gate = bool(ckpt.get("use_attn_gate", False))
+    use_se = bool(ckpt.get("use_se", False))
+    use_cbam = bool(ckpt.get("use_cbam", False))
+    # deep_supervision is training-only; inference uses only the main logits
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
-        base_filters=32,
+        base_filters=base_filters,
         dropout_p=float(ckpt.get("dropout_p", 0.0)),
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
         use_attn_gate=use_attn_gate,
+        use_se=use_se,
+        use_cbam=use_cbam,
+        deep_supervision=False,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     meta = dict(ckpt)
-    meta["in_channels"] = in_channels
-    meta["num_classes"] = num_classes
-    meta["use_coords"] = use_coords
+    meta.update({
+        "in_channels": in_channels,
+        "num_classes": num_classes,
+        "base_filters": base_filters,
+        "use_coords": use_coords,
+        "use_sdf_head": use_sdf_head,
+        "use_attn_gate": use_attn_gate,
+        "use_se": use_se,
+        "use_cbam": use_cbam,
+    })
     return model, meta
 
 
@@ -246,6 +321,12 @@ def parse_args():
     p.add_argument("--bbox_margin", type=int, default=24)
     p.add_argument("--thr", type=float, default=0.5)
     p.add_argument("--min_cc", type=int, default=20)
+    p.add_argument("--cc_min_mean_prob", type=float, default=0.0,
+                   help="remove CC whose mean(prob) < this (0 disables)")
+    p.add_argument("--filter_tubular", type=int, default=1, choices=[0, 1],
+                   help="heuristic: remove very thin & elongated CC (likely ducts)")
+    p.add_argument("--tubular_aspect", type=float, default=10.0)
+    p.add_argument("--tubular_thickness", type=int, default=3)
 
     p.add_argument("--use_gt_liver_bbox", action="store_true", help="use GT liver bbox (upper bound)")
     p.add_argument("--save_npy", action="store_true")

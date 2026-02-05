@@ -125,25 +125,22 @@ python infer.py \
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage tumor \
-  --save_dir train_logs/lits_tumor_bbox \
+  --save_dir train_logs/tumor_cbam_ds \
   --epochs 1000 \
   --batch_size 2 \
   --lr 1e-3 \
   --num_workers 4 \
   --patch_size 96 160 160 \
-  --train_ratio 0.8 \
-  --seed 0 \
   --tumor_use_pred_liver 1 \
   --tumor_pred_liver_dir train_logs/pred_liver_for_tumor \
   --tumor_pred_bbox_ratio 0.5 \
   --tumor_add_liver_prior 1 \
   --tumor_prior_type prob \
-  --tumor_bbox_margin 24 \
-  --tumor_pos_ratio 0.6 \
-  --tumor_hardneg_ratio 0.3 \
-  --tumor_alpha 0.75 \
-  --tumor_gamma 2.0 \
-  --resume train_logs/lits_tumor_bbox/tumor_last.pth
+  --use_attn_gate 1 \
+  --use_cbam 1 \
+  --deep_supervision 1 \
+  --amp 1 \
+  --base_filters 32
 
 
 ```

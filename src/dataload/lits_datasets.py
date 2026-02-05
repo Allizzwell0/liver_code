@@ -179,6 +179,7 @@ class LITSDatasetB2ND(Dataset):
         return len(self.case_ids)
 
     def _load_case_np(self, case_id: str):
+        blosc2.set_nthreads(1)
         dparams = {"nthreads": 1}
         data_file = self.preproc_dir / f"{case_id}.b2nd"
         seg_file = self.preproc_dir / f"{case_id}_seg.b2nd"
@@ -298,6 +299,7 @@ class LITSDatasetB2ND(Dataset):
         return img[:, z0:z0+pz, y0:y0+py, x0:x0+px], seg[z0:z0+pz, y0:y0+py, x0:x0+px]
 
     def __getitem__(self, idx: int):
+        blosc2.set_nthreads(1)  # make sure each worker uses single-thread blosc
         case_id = self.case_ids[idx]
         img, seg = self._load_case_np(case_id)
 

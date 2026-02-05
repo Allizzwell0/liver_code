@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-训练自建 3D UNet（nnUNetv2 预处理 LiTS .b2nd）：
-- liver / tumor 两阶段（可做三阶段：liver_coarse -> liver_refine -> tumor）
-- TensorBoard
-- checkpoint 保存与 resume
-- tumor：支持“部分用 pred liver bbox、部分用 GT liver bbox”混合裁剪 + 可追加 liver prior 通道
+Train 3D U-Net on nnUNetv2-preprocessed LiTS (.b2nd).
+
+This repo supports a 3-stage pipeline:
+  1) liver_coarse  (full volume, no priors/coords)
+  2) liver_refine  (liver ROI, coords + sdf head + priors)
+  3) tumor         (tumor ROI inside liver, optional pred-liver mix + liver prior)
+
+Tumor improvements in this version:
+  - optional CBAM/SE + AttentionGate on skips
+  - optional deep supervision (aux logits)
+  - focal-dice / focal-tversky loss
+  - optional AMP for faster training
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -39,10 +46,7 @@ def dice_ce_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int = 
 
 
 def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.75, gamma: float = 2.0, smooth: float = 1e-5) -> torch.Tensor:
-    """
-    tumor（极度类别不平衡）：focal(CE) + multi-class soft dice
-    target: (B,Z,Y,X) with class {0,1}
-    """
+    """Focal CE + soft dice (multi-class)."""
     ce_voxel = F.cross_entropy(logits, target, reduction="none")
     pt = torch.exp(-ce_voxel)
     focal = (alpha * (1.0 - pt).pow(gamma) * ce_voxel).mean()
@@ -64,12 +68,7 @@ def focal_tversky_loss(
     gamma: float = 1.33,
     smooth: float = 1e-5,
 ) -> torch.Tensor:
-    """Focal Tversky (binary foreground) + CE.
-
-    - alpha: weight for FP term; (1-alpha) weights FN term
-    - gamma: focal exponent on (1 - tversky)
-    This is often more stable than pure dice for tiny tumors.
-    """
+    """Focal Tversky (foreground) + CE (more stable for tiny tumors)."""
     ce = F.cross_entropy(logits, target)
     probs = torch.softmax(logits, dim=1)[:, 1]  # (B,Z,Y,X)
     tgt = (target == 1).float()
@@ -78,8 +77,8 @@ def focal_tversky_loss(
     fp = (probs * (1 - tgt)).sum(dims)
     fn = ((1 - probs) * tgt).sum(dims)
     tversky = (tp + smooth) / (tp + alpha * fp + (1 - alpha) * fn + smooth)
-    loss_tv = (1.0 - tversky).clamp_min(0.0).pow(gamma).mean()
-    return ce + loss_tv
+    return ce + (1.0 - tversky).clamp_min(0.0).pow(gamma).mean()
+
 
 def foreground_dice(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> float:
     preds = torch.argmax(logits, dim=1)
@@ -104,11 +103,16 @@ def soft_closing(p: torch.Tensor, k: int = 5) -> torch.Tensor:
 
 
 def unpack_out(out):
+    """Return logits, sdf(optional), aux_logits(optional)."""
     if isinstance(out, dict):
-        return out["logits"], out.get("sdf", None)
+        return out["logits"], out.get("sdf", None), out.get("aux_logits", None)
     if isinstance(out, (tuple, list)):
-        return out[0], (out[1] if len(out) > 1 else None)
-    return out, None
+        # (logits, sdf, aux?) is not used in this project, keep compatibility
+        logits = out[0]
+        sdf = out[1] if len(out) > 1 else None
+        aux = out[2] if len(out) > 2 else None
+        return logits, sdf, aux
+    return out, None, None
 
 
 # -------------------- utils -------------------- #
@@ -156,38 +160,45 @@ def parse_args():
     p.add_argument("--save_dir", type=str, default="train_logs/lits_b2nd")
     p.add_argument("--resume", type=str, default=None)
 
-    # 可选：用上一阶段权重初始化（不带 optimizer）
+    # optional: init with previous stage weights
     p.add_argument("--pretrained", type=str, default=None)
-    p.add_argument("--use_attn_gate", type=int, default=0, choices=[0, 1], help="use AttentionGate on skip connections (recommended for tumor)")
 
+    # model switches
+    p.add_argument("--base_filters", type=int, default=32)
+    p.add_argument("--use_attn_gate", type=int, default=0, choices=[0, 1], help="AttentionGate on skip (recommended for tumor)")
+    p.add_argument("--use_se", type=int, default=0, choices=[0, 1])
+    p.add_argument("--use_cbam", type=int, default=0, choices=[0, 1], help="CBAM = channel+spatial attention (stronger but slower)")
+    p.add_argument("--deep_supervision", type=int, default=0, choices=[0, 1], help="aux logits at decoder (tumor recommended)")
 
-    # --------- liver bbox 采样开关（0/1）---------
+    # AMP (faster, lower memory)
+    p.add_argument("--amp", type=int, default=1, choices=[0, 1])
+
+    # --------- liver bbox sampling ---------
     p.add_argument("--liver_use_bbox", type=int, default=1, choices=[0, 1])
     p.add_argument("--liver_bbox_margin", type=int, default=16)
 
-    # 二阶段用一阶段结果（pred liver）做 bbox / prior（可选）
+    # stage2: use stage1 predicted liver for bbox/prior (optional)
     p.add_argument("--liver_use_pred_bbox", type=int, default=0, choices=[0, 1])
     p.add_argument("--liver_pred_dir", type=str, default=None)
     p.add_argument("--liver_add_pred_prior", type=int, default=0, choices=[0, 1])
 
-    # --------- tumor: 使用 pred liver（部分）做 bbox + 追加 prior ---------
+    # --------- tumor: mix pred liver bbox + GT liver bbox + optional liver prior ---------
     p.add_argument("--tumor_use_pred_liver", type=int, default=0, choices=[0, 1])
     p.add_argument("--tumor_pred_liver_dir", type=str, default=None)
     p.add_argument("--tumor_pred_bbox_ratio", type=float, default=1.0,
-                   help="tumor 采样时 bbox 来源：pred liver 的比例（其余用 GT liver）。建议 0.3~0.7")
+                   help="bbox source ratio from pred liver (rest uses GT liver). e.g. 0.3~0.7")
     p.add_argument("--tumor_add_liver_prior", type=int, default=0, choices=[0, 1])
     p.add_argument("--tumor_prior_type", type=str, default="mask", choices=["mask", "prob"])
     p.add_argument("--tumor_bbox_margin", type=int, default=24)
 
-    # tumor patch 采样策略：pos / hardneg / random
+    # tumor sampling ratios
     p.add_argument("--tumor_pos_ratio", type=float, default=0.6)
     p.add_argument("--tumor_hardneg_ratio", type=float, default=0.3)
 
-    # tumor focal 超参
+    # tumor loss
     p.add_argument("--tumor_alpha", type=float, default=0.75)
-    p.add_argument("--tumor_gamma", type=float, default=2.0)
+    p.add_argument("--tumor_gamma", type=float, default=1.33)
     p.add_argument("--tumor_loss", type=str, default="focal_tversky", choices=["focal_dice", "focal_tversky"])
-
 
     return p.parse_args()
 
@@ -258,11 +269,15 @@ def main():
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        timeout=120 if args.num_workers > 0 else 0
     )
+    # tumor val is easy to get stuck by I/O/workers -> force single-process
+    val_workers = 0 if args.stage == "tumor" else max(1, args.num_workers // 2)
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False,
-        num_workers=max(1, args.num_workers // 2), pin_memory=True
+        num_workers=val_workers, pin_memory=True,
+        timeout=120 if val_workers > 0 else 0
     )
 
     # --------- Model ---------
@@ -270,17 +285,20 @@ def main():
     in_channels = int(sample_imgs.shape[1])
     num_classes = 2
 
-    # coords/sdf head：仅在 liver 且 bbox ROI 采样开启时启用（与你原脚本一致）
+    # coords/sdf head: only for liver refine (bbox ROI sampling)
     use_priors = (args.stage == "liver") and liver_use_bbox
 
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
-        base_filters=32,
+        base_filters=int(args.base_filters),
         dropout_p=0.0,
         use_coords=use_priors,
         use_sdf_head=use_priors,
         use_attn_gate=bool(args.use_attn_gate),
+        use_se=bool(args.use_se),
+        use_cbam=bool(args.use_cbam),
+        deep_supervision=bool(args.deep_supervision) if args.stage == "tumor" else False,
     ).to(device)
 
     if args.pretrained and (args.resume is None):
@@ -290,6 +308,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.9, patience=30, min_lr=1e-5
     )
+
+    # AMP
+    use_amp = bool(args.amp) and (device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -333,9 +355,13 @@ def main():
             "in_channels": int(in_channels),
             "num_classes": int(num_classes),
             "patch_size": tuple(patch_size),
+            "base_filters": int(args.base_filters),
             "use_coords": bool(use_priors),
             "use_sdf_head": bool(use_priors),
             "use_attn_gate": bool(args.use_attn_gate),
+            "use_se": bool(args.use_se),
+            "use_cbam": bool(args.use_cbam),
+            "deep_supervision": bool(args.deep_supervision) if args.stage == "tumor" else False,
             # liver
             "liver_use_bbox": bool(liver_use_bbox),
             "liver_bbox_margin": int(args.liver_bbox_margin),
@@ -356,9 +382,17 @@ def main():
             "tumor_loss": str(args.tumor_loss),
         }
 
+    def tumor_loss_fn(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if args.tumor_loss == "focal_dice":
+            return dice_focal_loss(logits, target, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+        return focal_tversky_loss(logits, target, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
+
+    ds_w = (0.4, 0.2, 0.1)  # fixed deep supervision weights (y1,y2,y3)
+
     current_epoch = start_epoch - 1
     try:
         for epoch in range(start_epoch, args.epochs + 1):
+            print(f"\n[{args.stage}] ===== epoch {epoch:03d}/{args.epochs} =====")
             current_epoch = epoch
 
             # --------- train ---------
@@ -373,27 +407,32 @@ def main():
                 sdf_gt = sdf_gt.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                out = model(imgs)
-                logits, sdf_pred = unpack_out(out)
 
-                if args.stage == "tumor":
-                    loss = (dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
-                            if args.tumor_loss == "focal_dice"
-                            else focal_tversky_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma)))
-                else:
-                    loss = dice_ce_loss(logits, targets, num_classes=num_classes)
-                    if use_priors:
-                        prob = torch.softmax(logits, dim=1)[:, 1:2]  # (B,1,Z,Y,X)
-                        prob_close = soft_closing(prob, k=7)
-                        loss_hole = F.l1_loss(prob, prob_close)
-                        loss_sdf = 0.0
-                        if sdf_pred is not None:
-                            loss_sdf = F.l1_loss(torch.tanh(sdf_pred), sdf_gt)
-                        loss = loss + 0.3 * loss_hole + 0.8 * loss_sdf
+                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                    out = model(imgs)
+                    logits, sdf_pred, aux_logits = unpack_out(out)
 
-                loss.backward()
+                    if args.stage == "tumor":
+                        loss = tumor_loss_fn(logits, targets)
+                        if aux_logits is not None:
+                            for w, a in zip(ds_w, aux_logits):
+                                loss = loss + float(w) * tumor_loss_fn(a, targets)
+                    else:
+                        loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+                        if use_priors:
+                            prob = torch.softmax(logits, dim=1)[:, 1:2]
+                            prob_close = soft_closing(prob, k=7)
+                            loss_hole = F.l1_loss(prob, prob_close)
+                            loss_sdf = 0.0
+                            if sdf_pred is not None:
+                                loss_sdf = F.l1_loss(torch.tanh(sdf_pred), sdf_gt)
+                            loss = loss + 0.3 * loss_hole + 0.8 * loss_sdf
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
                 tr_loss += float(loss.item())
                 tr_dice += foreground_dice(logits.detach(), targets)
@@ -408,28 +447,31 @@ def main():
             va_dice = 0.0
             n_va = 0
             with torch.no_grad():
+                print(f"[{args.stage}] validating...", flush=True)
                 for imgs, targets, sdf_gt, _ids in val_loader:
                     imgs = imgs.to(device, non_blocking=True)
                     targets = targets.to(device, non_blocking=True)
                     sdf_gt = sdf_gt.to(device, non_blocking=True)
 
-                    out = model(imgs)
-                    logits, sdf_pred = unpack_out(out)
+                    with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                        out = model(imgs)
+                        logits, sdf_pred, aux_logits = unpack_out(out)
 
-                    if args.stage == "tumor":
-                        loss = (dice_focal_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma))
-                            if args.tumor_loss == "focal_dice"
-                            else focal_tversky_loss(logits, targets, alpha=float(args.tumor_alpha), gamma=float(args.tumor_gamma)))
-                    else:
-                        loss = dice_ce_loss(logits, targets, num_classes=num_classes)
-                        if use_priors:
-                            prob = torch.softmax(logits, dim=1)[:, 1:2]
-                            prob_close = soft_closing(prob, k=7)
-                            loss_hole = F.l1_loss(prob, prob_close)
-                            loss_sdf = 0.0
-                            if sdf_pred is not None:
-                                loss_sdf = F.l1_loss(torch.tanh(sdf_pred), sdf_gt)
-                            loss = loss + 0.3 * loss_hole + 0.8 * loss_sdf
+                        if args.stage == "tumor":
+                            loss = tumor_loss_fn(logits, targets)
+                            if aux_logits is not None:
+                                for w, a in zip(ds_w, aux_logits):
+                                    loss = loss + float(w) * tumor_loss_fn(a, targets)
+                        else:
+                            loss = dice_ce_loss(logits, targets, num_classes=num_classes)
+                            if use_priors:
+                                prob = torch.softmax(logits, dim=1)[:, 1:2]
+                                prob_close = soft_closing(prob, k=7)
+                                loss_hole = F.l1_loss(prob, prob_close)
+                                loss_sdf = 0.0
+                                if sdf_pred is not None:
+                                    loss_sdf = F.l1_loss(torch.tanh(sdf_pred), sdf_gt)
+                                loss = loss + 0.3 * loss_hole + 0.8 * loss_sdf
 
                     va_loss += float(loss.item())
                     va_dice += foreground_dice(logits, targets)
@@ -466,8 +508,12 @@ def main():
 
     except KeyboardInterrupt:
         interrupt_path = save_dir / f"{args.stage}_interrupt.pth"
-        save_ckpt(interrupt_path, pack_ckpt(current_epoch))
-        print(f"\n[Interrupted] checkpoint saved: {interrupt_path}")
+        print(f"\n[Interrupted] saving checkpoint -> {interrupt_path}")
+        try:
+            save_ckpt(interrupt_path, pack_ckpt(current_epoch))
+            print(f"[Interrupted] checkpoint saved: {interrupt_path}")
+        except KeyboardInterrupt:
+            print("[WARN] interrupted during checkpoint saving; skipped.")
 
     finally:
         writer.close()
