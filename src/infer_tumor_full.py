@@ -1,265 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Full-volume tumor inference on nnUNetv2-preprocessed LiTS (.b2nd) or your own preprocessed data.
+Full-volume tumor inference with sliding window, using liver predictions to define ROI bbox.
 
 Inputs:
-  - preproc_dir: contains <case>.b2nd (and optionally <case>_seg.b2nd if labeled)
-  - liver_dir: outputs from infer.py --save_prob (at least <case>_pred_liver.npy; optional <case>_prob_liver.npy)
+  - preproc_dir: nnUNetv2-preprocessed LiTS-style .b2nd volumes
+  - ckpt_tumor: tumor segmentation model
+  - liver_dir: directory containing liver predictions from infer.py:
+      <case>_pred_liver.npy (0/1) and optionally <case>_prob_liver.npy (0..1)
 
-Outputs (out_dir):
-  - <case>_pred_tumor.npy  (Z,Y,X) uint8
-  - <case>_prob_tumor.npy  (Z,Y,X) float32 if --save_prob
+Outputs (per case):
+  - <out_dir>/<case>_tumor_pred.npy  (uint8 0/1, Z,Y,X)
+  - <out_dir>/<case>_tumor_prob.npy  (float32 0..1, Z,Y,X)  [if --save_prob]
+
+Postprocess can be tuned by tune_tumor_postprocess.py (JSON) or set via CLI.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple, List, Optional
 
+import blosc2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-import blosc2
 from models.unet3D import UNet3D
+from tumor_postprocess import TumorPostprocessConfig, postprocess_tumor_prob
 
-
-# -------------------- io -------------------- #
-
-def list_case_ids(preproc_dir: Path) -> List[str]:
-    ids = []
-    for p in sorted(preproc_dir.glob("*.b2nd")):
-        name = p.stem
-        if name.endswith("_seg"):
-            continue
-        ids.append(name)
-    return ids
-
-
-def load_case_img(preproc_dir: Path, case_id: str) -> np.ndarray:
-    blosc2.set_nthreads(1)
-    data_file = preproc_dir / f"{case_id}.b2nd"
-    if not data_file.is_file():
-        raise FileNotFoundError(data_file)
-    data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams={"nthreads": 1})
-    img = data_b[:].astype(np.float32)  # (C,Z,Y,X)
-    return img
-
-
-def load_liver_mask(liver_dir: Path, case_id: str) -> np.ndarray:
-    p = liver_dir / f"{case_id}_pred_liver.npy"
-    if not p.is_file():
-        # fallback name
-        p2 = liver_dir / f"{case_id}_liver_pred.npy"
-        if p2.is_file():
-            p = p2
-        else:
-            raise FileNotFoundError(f"missing liver pred for {case_id}: {p}")
-    m = np.load(p)
-    return (m > 0).astype(np.uint8)
-
-
-def load_liver_prob(liver_dir: Path, case_id: str) -> np.ndarray | None:
-    for name in [f"{case_id}_prob_liver.npy", f"{case_id}_liver_prob.npy", f"{case_id}_pred_liver_prob.npy"]:
-        p = liver_dir / name
-        if p.is_file():
-            return np.load(p).astype(np.float32)
-    return None
-
-
-# -------------------- misc -------------------- #
-
-def bbox_from_mask(mask_zyx: np.ndarray, margin: int = 0) -> Tuple[slice, slice, slice]:
-    zz, yy, xx = np.where(mask_zyx > 0)
-    if len(zz) == 0:
-        return slice(0, mask_zyx.shape[0]), slice(0, mask_zyx.shape[1]), slice(0, mask_zyx.shape[2])
-    z0, z1 = zz.min(), zz.max() + 1
-    y0, y1 = yy.min(), yy.max() + 1
-    x0, x1 = xx.min(), xx.max() + 1
-
-    z0 = max(0, z0 - margin)
-    y0 = max(0, y0 - margin)
-    x0 = max(0, x0 - margin)
-    z1 = min(mask_zyx.shape[0], z1 + margin)
-    y1 = min(mask_zyx.shape[1], y1 + margin)
-    x1 = min(mask_zyx.shape[2], x1 + margin)
-    return slice(z0, z1), slice(y0, y1), slice(x0, x1)
-
-
-def remove_small_cc(mask_zyx: np.ndarray, min_size: int = 20) -> np.ndarray:
-    try:
-        from scipy.ndimage import label as ndi_label
-    except Exception:
-        return mask_zyx
-    lab, n = ndi_label(mask_zyx.astype(np.uint8))
-    if n == 0:
-        return mask_zyx
-    out = np.zeros_like(mask_zyx, dtype=np.uint8)
-    for k in range(1, n + 1):
-        comp = (lab == k)
-        if int(comp.sum()) >= int(min_size):
-            out[comp] = 1
-    return out
-
-
-def postprocess_tumor_mask(
-    prob_tumor_zyx: np.ndarray,
-    liver_roi_zyx: np.ndarray,
-    thr: float = 0.5,
-    min_cc: int = 20,
-    cc_min_mean_prob: float = 0.0,
-    filter_tubular: bool = True,
-    tubular_aspect: float = 10.0,
-    tubular_thickness: int = 3,
-) -> np.ndarray:
-    mask = (prob_tumor_zyx > float(thr)).astype(np.uint8)
-    mask = (mask * (liver_roi_zyx > 0).astype(np.uint8)).astype(np.uint8)
-    mask = remove_small_cc(mask, min_size=int(min_cc))
-
-    if (cc_min_mean_prob > 0) or filter_tubular:
-        try:
-            from scipy.ndimage import label as ndi_label
-        except Exception:
-            return mask
-
-        lab, n = ndi_label(mask.astype(np.uint8))
-        if n <= 0:
-            return mask
-
-        keep = np.zeros(n + 1, dtype=np.uint8)
-        for k in range(1, n + 1):
-            comp = (lab == k)
-            if comp.sum() == 0:
-                continue
-
-            if cc_min_mean_prob > 0:
-                mp = float(prob_tumor_zyx[comp].mean())
-                if mp < float(cc_min_mean_prob):
-                    continue
-
-            if filter_tubular:
-                zs, ys, xs = np.where(comp)
-                dz = int(zs.max() - zs.min() + 1)
-                dy = int(ys.max() - ys.min() + 1)
-                dx = int(xs.max() - xs.min() + 1)
-                th = min(dz, dy, dx)
-                asp = max(dz, dy, dx) / max(1, th)
-                if (th <= int(tubular_thickness)) and (asp >= float(tubular_aspect)):
-                    continue
-
-            keep[k] = 1
-
-        return (keep[lab] > 0).astype(np.uint8)
-
-    return mask
-
-
-# -------------------- model / sliding window -------------------- #
-
-@torch.no_grad()
-def sliding_window_prob(vol_czyx: np.ndarray, model: torch.nn.Module,
-                        patch_size: Tuple[int, int, int],
-                        stride: Tuple[int, int, int],
-                        num_classes: int = 2,
-                        device: torch.device | None = None) -> np.ndarray:
-    """
-    vol_czyx: (C,Z,Y,X) numpy float32
-    Returns: prob_map (num_classes, Z, Y, X)
-    """
-    if device is None:
-        device = next(model.parameters()).device
-
-    C, Z, Y, X = vol_czyx.shape
-    pz, py, px = patch_size
-    sz, sy, sx = stride
-
-    prob_map = np.zeros((num_classes, Z, Y, X), dtype=np.float32)
-    count_map = np.zeros((Z, Y, X), dtype=np.float32)
-
-    # gaussian-ish weights reduce seams (cheap separable)
-    wz = np.hanning(pz) if pz > 1 else np.ones((1,), dtype=np.float32)
-    wy = np.hanning(py) if py > 1 else np.ones((1,), dtype=np.float32)
-    wx = np.hanning(px) if px > 1 else np.ones((1,), dtype=np.float32)
-    w_patch = (wz[:, None, None] * wy[None, :, None] * wx[None, None, :]).astype(np.float32)
-    w_patch = np.maximum(w_patch, 1e-3)  # avoid zero
-
-    z_starts = list(range(0, max(Z - pz, 0) + 1, sz))
-    y_starts = list(range(0, max(Y - py, 0) + 1, sy))
-    x_starts = list(range(0, max(X - px, 0) + 1, sx))
-    if len(z_starts) == 0:
-        z_starts = [0]
-    if z_starts[-1] != Z - pz:
-        z_starts.append(max(Z - pz, 0))
-    if len(y_starts) == 0:
-        y_starts = [0]
-    if y_starts[-1] != Y - py:
-        y_starts.append(max(Y - py, 0))
-    if len(x_starts) == 0:
-        x_starts = [0]
-    if x_starts[-1] != X - px:
-        x_starts.append(max(X - px, 0))
-
-    for z0 in z_starts:
-        for y0 in y_starts:
-            for x0 in x_starts:
-                z1, y1, x1 = z0 + pz, y0 + py, x0 + px
-                patch = vol_czyx[:, z0:z1, y0:y1, x0:x1]
-                # pad if needed
-                pad_z = max(0, pz - patch.shape[1])
-                pad_y = max(0, py - patch.shape[2])
-                pad_x = max(0, px - patch.shape[3])
-                if pad_z or pad_y or pad_x:
-                    patch = np.pad(patch, ((0, 0), (0, pad_z), (0, pad_y), (0, pad_x)), mode="edge")
-
-                inp = torch.from_numpy(patch[None]).to(device, non_blocking=True)  # (1,C,pz,py,px)
-                out = model(inp)
-                logits = out["logits"] if isinstance(out, dict) else out
-                probs = torch.softmax(logits, dim=1)[0].float().cpu().numpy()  # (K,pz,py,px)
-
-                # crop back to original (if padded)
-                probs = probs[:, :min(pz, Z - z0), :min(py, Y - y0), :min(px, X - x0)]
-                w = w_patch[:probs.shape[1], :probs.shape[2], :probs.shape[3]]
-
-                prob_map[:, z0:z0 + probs.shape[1], y0:y0 + probs.shape[2], x0:x0 + probs.shape[3]] += probs * w[None]
-                count_map[z0:z0 + probs.shape[1], y0:y0 + probs.shape[2], x0:x0 + probs.shape[3]] += w
-
-    prob_map = prob_map / np.clip(count_map[None], 1e-6, None)
-    return prob_map
-
-
-def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, dict]:
-    ckpt = torch.load(ckpt_path, map_location=device)
-    in_channels = int(ckpt.get("in_channels", 1))
-    num_classes = int(ckpt.get("num_classes", 2))
-    base_filters = int(ckpt.get("base_filters", 32))
-    use_coords = bool(ckpt.get("use_coords", False))
-    use_sdf_head = bool(ckpt.get("use_sdf_head", False))
-    use_attn_gate = bool(ckpt.get("use_attn_gate", False))
-    use_se = bool(ckpt.get("use_se", False))
-    use_cbam = bool(ckpt.get("use_cbam", False))
-
-    model = UNet3D(
-        in_channels=in_channels,
-        num_classes=num_classes,
-        base_filters=base_filters,
-        dropout_p=float(ckpt.get("dropout_p", 0.0)),
-        use_coords=use_coords,
-        use_sdf_head=use_sdf_head,
-        use_attn_gate=use_attn_gate,
-        use_se=use_se,
-        use_cbam=use_cbam,
-        deep_supervision=False,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
-    model.eval()
-    meta = dict(ckpt)
-    return model, meta
-
-
-# -------------------- main -------------------- #
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -267,87 +39,292 @@ def parse_args():
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--ckpt_tumor", type=str, required=True)
     p.add_argument("--liver_dir", type=str, required=True)
+
+    p.add_argument("--case_id", type=str, default=None)
     p.add_argument("--patch_size", type=int, nargs=3, default=[96, 160, 160])
     p.add_argument("--stride", type=int, nargs=3, default=[48, 80, 80])
-    p.add_argument("--bbox_margin", type=int, default=24)
 
-    p.add_argument("--thr", type=float, default=0.5)
+    p.add_argument("--bbox_margin", type=int, default=24)
+    p.add_argument("--tumor_prior_type", type=str, default="prob", choices=["prob", "mask"],
+                   help="if tumor model expects 2 channels, use liver prob or liver mask as prior channel")
+    p.add_argument("--liver_bbox_from", type=str, default="mask", choices=["mask", "prob", "union"])
+    p.add_argument("--liver_prob_thr", type=float, default=0.1)
+
+    # postprocess (if postprocess_json provided, it overrides these)
+    p.add_argument("--postprocess_json", type=str, default=None)
+    p.add_argument("--thr", type=float, default=0.5, help="fixed threshold; set -1 to enable hysteresis mode")
+    p.add_argument("--use_hysteresis", type=int, default=0, choices=[0, 1])
+    p.add_argument("--q_high", type=float, default=99.5)
+    p.add_argument("--seed_floor", type=float, default=0.5)
+    p.add_argument("--low_ratio", type=float, default=0.5)
+    p.add_argument("--low_floor", type=float, default=0.2)
     p.add_argument("--min_cc", type=int, default=20)
-    p.add_argument("--cc_min_mean_prob", type=float, default=0.0)
-    p.add_argument("--filter_tubular", type=int, default=1, choices=[0, 1])
     p.add_argument("--tubular_aspect", type=float, default=10.0)
-    p.add_argument("--tubular_thickness", type=int, default=3)
+    p.add_argument("--tubular_thickness", type=int, default=5)
 
     p.add_argument("--save_prob", action="store_true")
     return p.parse_args()
 
 
+def get_logits(model_out):
+    if isinstance(model_out, dict):
+        return model_out["logits"]
+    if isinstance(model_out, (tuple, list)):
+        return model_out[0]
+    return model_out
+
+
+def pad_to_min(volume: torch.Tensor, patch: Tuple[int, int, int]) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+    _, _, Z, Y, X = volume.shape
+    pz, py, px = patch
+    pad_z = max(0, pz - Z)
+    pad_y = max(0, py - Y)
+    pad_x = max(0, px - X)
+    if pad_z or pad_y or pad_x:
+        volume = F.pad(volume, (0, pad_x, 0, pad_y, 0, pad_z))
+    return volume, (Z, Y, X)
+
+
+def sliding_window_prob(
+    volume: torch.Tensor,  # (1,C,Z,Y,X)
+    model: torch.nn.Module,
+    patch_size: Tuple[int, int, int],
+    stride: Tuple[int, int, int],
+    num_classes: int,
+) -> torch.Tensor:
+    model.eval()
+    volume, orig = pad_to_min(volume, patch_size)
+    _, _, Z, Y, X = volume.shape
+    pz, py, px = patch_size
+    sz, sy, sx = stride
+
+    prob = torch.zeros((num_classes, Z, Y, X), device=volume.device, dtype=torch.float32)
+    w = torch.zeros((1, Z, Y, X), device=volume.device, dtype=torch.float32)
+
+    z_starts = list(range(0, max(Z - pz + 1, 1), sz))
+    y_starts = list(range(0, max(Y - py + 1, 1), sy))
+    x_starts = list(range(0, max(X - px + 1, 1), sx))
+    if z_starts[-1] + pz < Z:
+        z_starts.append(Z - pz)
+    if y_starts[-1] + py < Y:
+        y_starts.append(Y - py)
+    if x_starts[-1] + px < X:
+        x_starts.append(X - px)
+
+    with torch.no_grad():
+        for z0 in z_starts:
+            for y0 in y_starts:
+                for x0 in x_starts:
+                    patch = volume[:, :, z0:z0+pz, y0:y0+py, x0:x0+px]
+                    out = model(patch)
+                    logits = get_logits(out)
+                    probs = torch.softmax(logits, dim=1)[0]
+                    prob[:, z0:z0+pz, y0:y0+py, x0:x0+px] += probs
+                    w[:, z0:z0+pz, y0:y0+py, x0:x0+px] += 1.0
+
+    prob = prob / torch.clamp_min(w, 1.0)
+    oZ, oY, oX = orig
+    return prob[:, :oZ, :oY, :oX]
+
+
+def bbox_from_mask(mask: np.ndarray, margin: int) -> Optional[Tuple[int, int, int, int, int, int]]:
+    idx = np.where(mask > 0)
+    if idx[0].size == 0:
+        return None
+    z0, z1 = int(idx[0].min()), int(idx[0].max())
+    y0, y1 = int(idx[1].min()), int(idx[1].max())
+    x0, x1 = int(idx[2].min()), int(idx[2].max())
+    z0 -= margin; y0 -= margin; x0 -= margin
+    z1 += margin; y1 += margin; x1 += margin
+    Z, Y, X = mask.shape
+    z0 = max(0, min(z0, Z - 1)); z1 = max(0, min(z1, Z - 1))
+    y0 = max(0, min(y0, Y - 1)); y1 = max(0, min(y1, Y - 1))
+    x0 = max(0, min(x0, X - 1)); x1 = max(0, min(x1, X - 1))
+    return z0, z1, y0, y1, x0, x1
+
+
+def load_case_b2nd(preproc_dir: Path, case_id: str) -> np.ndarray:
+    dparams = {"nthreads": 1}
+    data_file = preproc_dir / f"{case_id}.b2nd"
+    data_b = blosc2.open(urlpath=str(data_file), mode="r", dparams=dparams)
+    img = data_b[:].astype(np.float32)  # (C,Z,Y,X)
+    return img
+
+
+def list_case_ids(preproc_dir: Path) -> List[str]:
+    return [p.stem for p in sorted(preproc_dir.glob("*.pkl"))]
+
+
+def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, dict]:
+    ckpt = torch.load(ckpt_path, map_location=device)
+    in_channels = int(ckpt.get("in_channels", 1))
+    num_classes = int(ckpt.get("num_classes", 2))
+    use_coords = bool(ckpt.get("use_coords", False))
+    use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+
+    model = UNet3D(
+        in_channels=in_channels,
+        num_classes=num_classes,
+        base_filters=32,
+        dropout_p=0.0,
+        use_coords=use_coords,
+        use_sdf_head=use_sdf_head,
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"], strict=True)
+    model.eval()
+    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head)
+    return model, meta
+
+
+def load_liver_outputs(
+    liver_dir: Path,
+    case_id: str,
+    shape_zyx: Tuple[int, int, int],
+    src: str,
+    thr: float
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Returns:
+      liver_bbox_mask (uint8 0/1, Z,Y,X), and liver_prob (float32, Z,Y,X) if exists.
+    """
+    mask = None
+    for name in [f"{case_id}_pred_liver.npy", f"{case_id}_liver_pred.npy"]:
+        p = liver_dir / name
+        if p.is_file():
+            mask = (np.load(p) > 0).astype(np.uint8)
+            break
+    prob = None
+    for name in [f"{case_id}_prob_liver.npy", f"{case_id}_liver_prob.npy"]:
+        p = liver_dir / name
+        if p.is_file():
+            prob = np.load(p).astype(np.float32)
+            break
+
+    Z, Y, X = shape_zyx
+    if mask is not None:
+        mask = mask[:Z, :Y, :X]
+        if mask.shape != shape_zyx:
+            pad = np.zeros(shape_zyx, dtype=np.uint8)
+            zz, yy, xx = mask.shape
+            pad[:zz, :yy, :xx] = mask
+            mask = pad
+    if prob is not None:
+        prob = prob[:Z, :Y, :X]
+        if prob.shape != shape_zyx:
+            pad = np.zeros(shape_zyx, dtype=np.float32)
+            zz, yy, xx = prob.shape
+            pad[:zz, :yy, :xx] = prob
+            prob = pad
+
+    if mask is None and prob is None:
+        return np.zeros(shape_zyx, dtype=np.uint8), None
+
+    src = src.lower().strip()
+    if src not in ["mask", "prob", "union"]:
+        src = "mask"
+
+    if src == "mask":
+        bbox_mask = mask if mask is not None else (prob >= float(thr)).astype(np.uint8)
+    elif src == "prob":
+        if prob is None:
+            bbox_mask = mask if mask is not None else np.zeros(shape_zyx, dtype=np.uint8)
+        else:
+            bbox_mask = (prob >= float(thr)).astype(np.uint8)
+    else:
+        m0 = mask if mask is not None else np.zeros(shape_zyx, dtype=np.uint8)
+        if prob is None:
+            bbox_mask = m0
+        else:
+            pm = (prob >= float(thr)).astype(np.uint8)
+            bbox_mask = ((m0 > 0) | (pm > 0)).astype(np.uint8)
+
+    return bbox_mask.astype(np.uint8), prob
+
+
+def build_cfg(args) -> TumorPostprocessConfig:
+    if args.postprocess_json:
+        j = json.loads(Path(args.postprocess_json).read_text(encoding="utf-8"))
+        cfg_dict = j.get("cfg", j)
+        return TumorPostprocessConfig(**cfg_dict)
+
+    cfg = TumorPostprocessConfig(
+        thr=float(args.thr),
+        use_hysteresis=bool(args.use_hysteresis),
+        q_high=float(args.q_high),
+        seed_floor=float(args.seed_floor),
+        low_ratio=float(args.low_ratio),
+        low_floor=float(args.low_floor),
+        min_cc=int(args.min_cc),
+        tubular_aspect=float(args.tubular_aspect),
+        tubular_thickness=int(args.tubular_thickness),
+    )
+    return cfg
+
+
 def main():
     args = parse_args()
-    preproc_dir = Path(args.preproc_dir)
-    out_dir = Path(args.out_dir)
-    liver_dir = Path(args.liver_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    blosc2.set_nthreads(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    model, meta = load_model(args.ckpt_tumor, device)
-    tumor_add_liver_prior = bool(meta.get("tumor_add_liver_prior", False))
-    tumor_prior_type = str(meta.get("tumor_prior_type", "mask"))
+    preproc_dir = Path(args.preproc_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    case_ids = list_case_ids(preproc_dir)
-    print(f"Found {len(case_ids)} case(s).")
+    liver_dir = Path(args.liver_dir)
+    model, meta = load_model(args.ckpt_tumor, device)
+    cfg = build_cfg(args)
+    print("[Tumor] postprocess cfg:", cfg)
+
     patch_size = tuple(args.patch_size)
     stride = tuple(args.stride)
 
-    for cid in tqdm(case_ids, desc="Infer-Tumor"):
-        img = load_case_img(preproc_dir, cid)  # (C,Z,Y,X)
-        liver_mask = load_liver_mask(liver_dir, cid)  # (Z,Y,X)
-        zsl, ysl, xsl = bbox_from_mask(liver_mask, margin=int(args.bbox_margin))
+    case_ids = [args.case_id] if args.case_id else list_case_ids(preproc_dir)
+    print(f"Found {len(case_ids)} case(s).")
 
-        img_roi = img[:, zsl, ysl, xsl]
-        liver_roi = liver_mask[zsl, ysl, xsl].astype(np.uint8)
+    for case_id in tqdm(case_ids, desc="Infer-Tumor", unit="case"):
+        img = load_case_b2nd(preproc_dir, case_id)  # (C,Z,Y,X)
+        C, Z, Y, X = img.shape
 
-        # optional liver prior channel (must match training)
-        if tumor_add_liver_prior:
-            if tumor_prior_type == "prob":
-                prob = load_liver_prob(liver_dir, cid)
-                if prob is None:
-                    prior = liver_mask.astype(np.float32)
-                else:
-                    prior = prob
+        # liver bbox mask
+        liver_bbox_mask, liver_prob = load_liver_outputs(liver_dir, case_id, (Z, Y, X), args.liver_bbox_from, args.liver_prob_thr)
+        b = bbox_from_mask(liver_bbox_mask, margin=int(args.bbox_margin))
+        if b is None:
+            b = (0, Z - 1, 0, Y - 1, 0, X - 1)
+        z0, z1, y0, y1, x0, x1 = b
+
+        # crop ROI for inference
+        roi = img[:, z0:z1+1, y0:y1+1, x0:x1+1]  # (C,z,y,x)
+
+        in_ch = int(meta["in_channels"])
+        if in_ch == 1:
+            in_roi = roi
+        else:
+            # add liver prior channel
+            if (args.tumor_prior_type == "prob") and (liver_prob is not None):
+                prior_full = liver_prob
+                prior_roi = prior_full[z0:z1+1, y0:y1+1, x0:x1+1][None, ...].astype(np.float32)
             else:
-                prior = liver_mask.astype(np.float32)
-            prior_roi = prior[zsl, ysl, xsl].astype(np.float32)
-            img_roi = np.concatenate([img_roi, prior_roi[None]], axis=0)
+                prior_roi = liver_bbox_mask[z0:z1+1, y0:y1+1, x0:x1+1][None, ...].astype(np.float32)
+            in_roi = np.concatenate([roi, prior_roi], axis=0).astype(np.float32)
 
-        prob_map = sliding_window_prob(img_roi, model, patch_size=patch_size, stride=stride,
-                                       num_classes=int(meta.get("num_classes", 2)), device=device)
-        prob_tumor_roi = prob_map[1]  # (Z,Y,X)
+        vol = torch.from_numpy(in_roi[None, ...]).to(device)
 
-        # paste back to full size
-        Z, Y, X = liver_mask.shape
-        prob_tumor = np.zeros((Z, Y, X), dtype=np.float32)
-        prob_tumor[zsl, ysl, xsl] = prob_tumor_roi
+        prob_roi = sliding_window_prob(vol, model, patch_size, stride, num_classes=meta["num_classes"])
+        tumor_prob_roi = prob_roi[1].detach().cpu().numpy().astype(np.float32)
 
-        pred_mask = np.zeros((Z, Y, X), dtype=np.uint8)
-        pred_mask[zsl, ysl, xsl] = postprocess_tumor_mask(
-            prob_tumor_roi,
-            liver_roi,
-            thr=float(args.thr),
-            min_cc=int(args.min_cc),
-            cc_min_mean_prob=float(args.cc_min_mean_prob),
-            filter_tubular=bool(args.filter_tubular),
-            tubular_aspect=float(args.tubular_aspect),
-            tubular_thickness=int(args.tubular_thickness),
-        )
+        # paste back to full volume prob
+        prob_full = np.zeros((Z, Y, X), dtype=np.float32)
+        prob_full[z0:z1+1, y0:y1+1, x0:x1+1] = tumor_prob_roi
 
-        np.save(out_dir / f"{cid}_pred_tumor.npy", pred_mask)
+        pred_full = postprocess_tumor_prob(prob_full, liver_bbox_mask, cfg)
+
+        np.save(out_dir / f"{case_id}_tumor_pred.npy", pred_full.astype(np.uint8))
         if args.save_prob:
-            np.save(out_dir / f"{cid}_prob_tumor.npy", prob_tumor)
+            np.save(out_dir / f"{case_id}_tumor_prob.npy", prob_full.astype(np.float32))
 
-    print("Done. Output:", out_dir)
+    print("Done.")
 
 
 if __name__ == "__main__":

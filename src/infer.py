@@ -175,39 +175,20 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     ckpt = torch.load(ckpt_path, map_location=device)
     in_channels = int(ckpt.get("in_channels", 1))
     num_classes = int(ckpt.get("num_classes", 2))
-    base_filters = int(ckpt.get("base_filters", 32))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
-    use_attn_gate = bool(ckpt.get("use_attn_gate", False))
-    use_se = bool(ckpt.get("use_se", False))
-    use_cbam = bool(ckpt.get("use_cbam", False))
 
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
-        base_filters=base_filters,
-        dropout_p=float(ckpt.get("dropout_p", 0.0)),
+        base_filters=32,
+        dropout_p=0.0,
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
-        use_attn_gate=use_attn_gate,
-        use_se=use_se,
-        use_cbam=use_cbam,
-        deep_supervision=False,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
-
-    meta = dict(ckpt)
-    meta.update({
-        "in_channels": in_channels,
-        "num_classes": num_classes,
-        "base_filters": base_filters,
-        "use_coords": use_coords,
-        "use_sdf_head": use_sdf_head,
-        "use_attn_gate": use_attn_gate,
-        "use_se": use_se,
-        "use_cbam": use_cbam,
-    })
+    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head)
     return model, meta
 
 

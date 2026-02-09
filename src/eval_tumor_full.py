@@ -15,6 +15,7 @@ If you don't provide --liver_dir, you can provide --ckpt_coarse/--ckpt_refine an
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Tuple, List, Optional
 
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from models.unet3D import UNet3D
+from tumor_postprocess import TumorPostprocessConfig, postprocess_tumor_prob
 
 
 # ----------------- helpers ----------------- #
@@ -86,67 +88,6 @@ def remove_small_cc(mask: np.ndarray, min_size: int = 20) -> np.ndarray:
     return out
 
 
-
-
-def postprocess_tumor_mask(
-    prob_tumor_zyx: np.ndarray,
-    liver_roi_zyx: np.ndarray,
-    thr: float = 0.5,
-    min_cc: int = 20,
-    cc_min_mean_prob: float = 0.0,
-    filter_tubular: bool = True,
-    tubular_aspect: float = 10.0,
-    tubular_thickness: int = 3,
-) -> np.ndarray:
-    """
-    Tumor postprocess inside liver ROI:
-      1) thr -> binary
-      2) mask *= liver_roi
-      3) remove small CC
-      4) (optional) remove low-mean-prob CC
-      5) (optional) remove thin & elongated CC (duct-like)
-    """
-    mask = (prob_tumor_zyx > float(thr)).astype(np.uint8)
-    mask = (mask * (liver_roi_zyx > 0).astype(np.uint8)).astype(np.uint8)
-    mask = remove_small_cc(mask, min_size=int(min_cc))
-
-    if (cc_min_mean_prob > 0) or filter_tubular:
-        try:
-            from scipy.ndimage import label as ndi_label
-        except Exception:
-            return mask
-
-        lab, n = ndi_label(mask.astype(np.uint8))
-        if n <= 0:
-            return mask
-
-        keep = np.zeros(n + 1, dtype=np.uint8)
-        keep[0] = 0
-        for k in range(1, n + 1):
-            comp = (lab == k)
-            if comp.sum() == 0:
-                continue
-
-            if cc_min_mean_prob > 0:
-                mp = float(prob_tumor_zyx[comp].mean())
-                if mp < float(cc_min_mean_prob):
-                    continue
-
-            if filter_tubular:
-                zs, ys, xs = np.where(comp)
-                dz = int(zs.max() - zs.min() + 1)
-                dy = int(ys.max() - ys.min() + 1)
-                dx = int(xs.max() - xs.min() + 1)
-                th = min(dz, dy, dx)
-                asp = max(dz, dy, dx) / max(1, th)
-                if (th <= int(tubular_thickness)) and (asp >= float(tubular_aspect)):
-                    continue
-
-            keep[k] = 1
-
-        return (keep[lab] > 0).astype(np.uint8)
-
-    return mask
 def bbox_from_mask(mask: np.ndarray, margin: int) -> Optional[Tuple[int, int, int, int, int, int]]:
     idx = np.where(mask > 0)
     if idx[0].size == 0:
@@ -261,38 +202,22 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     ckpt = torch.load(ckpt_path, map_location=device)
     in_channels = int(ckpt.get("in_channels", 1))
     num_classes = int(ckpt.get("num_classes", 2))
-    base_filters = int(ckpt.get("base_filters", 32))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
-    use_attn_gate = bool(ckpt.get("use_attn_gate", False))
-    use_se = bool(ckpt.get("use_se", False))
-    use_cbam = bool(ckpt.get("use_cbam", False))
-    # deep_supervision is training-only; inference uses only the main logits
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
-        base_filters=base_filters,
+        base_filters=32,
         dropout_p=float(ckpt.get("dropout_p", 0.0)),
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
-        use_attn_gate=use_attn_gate,
-        use_se=use_se,
-        use_cbam=use_cbam,
-        deep_supervision=False,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     meta = dict(ckpt)
-    meta.update({
-        "in_channels": in_channels,
-        "num_classes": num_classes,
-        "base_filters": base_filters,
-        "use_coords": use_coords,
-        "use_sdf_head": use_sdf_head,
-        "use_attn_gate": use_attn_gate,
-        "use_se": use_se,
-        "use_cbam": use_cbam,
-    })
+    meta["in_channels"] = in_channels
+    meta["num_classes"] = num_classes
+    meta["use_coords"] = use_coords
     return model, meta
 
 
@@ -319,14 +244,18 @@ def parse_args():
     p.add_argument("--stride", type=int, nargs=3, default=[48, 80, 80])
 
     p.add_argument("--bbox_margin", type=int, default=24)
-    p.add_argument("--thr", type=float, default=0.5)
+
+    # postprocess
+    p.add_argument("--postprocess_json", type=str, default=None, help="from tune_tumor_postprocess.py")
+    p.add_argument("--thr", type=float, default=0.5, help="fixed threshold; set -1 with --use_hysteresis=1")
+    p.add_argument("--use_hysteresis", type=int, default=0, choices=[0, 1])
+    p.add_argument("--q_high", type=float, default=99.5)
+    p.add_argument("--seed_floor", type=float, default=0.5)
+    p.add_argument("--low_ratio", type=float, default=0.5)
+    p.add_argument("--low_floor", type=float, default=0.2)
     p.add_argument("--min_cc", type=int, default=20)
-    p.add_argument("--cc_min_mean_prob", type=float, default=0.0,
-                   help="remove CC whose mean(prob) < this (0 disables)")
-    p.add_argument("--filter_tubular", type=int, default=1, choices=[0, 1],
-                   help="heuristic: remove very thin & elongated CC (likely ducts)")
     p.add_argument("--tubular_aspect", type=float, default=10.0)
-    p.add_argument("--tubular_thickness", type=int, default=3)
+    p.add_argument("--tubular_thickness", type=int, default=5)
 
     p.add_argument("--use_gt_liver_bbox", action="store_true", help="use GT liver bbox (upper bound)")
     p.add_argument("--save_npy", action="store_true")
@@ -355,6 +284,24 @@ def main():
     blosc2.set_nthreads(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # postprocess cfg
+    if args.postprocess_json:
+        j = json.loads(Path(args.postprocess_json).read_text(encoding="utf-8"))
+        cfg_dict = j.get("cfg", j)
+        cfg_pp = TumorPostprocessConfig(**cfg_dict)
+    else:
+        cfg_pp = TumorPostprocessConfig(
+            thr=float(args.thr),
+            use_hysteresis=bool(args.use_hysteresis),
+            q_high=float(args.q_high),
+            seed_floor=float(args.seed_floor),
+            low_ratio=float(args.low_ratio),
+            low_floor=float(args.low_floor),
+            min_cc=int(args.min_cc),
+            tubular_aspect=float(args.tubular_aspect),
+            tubular_thickness=int(args.tubular_thickness),
+        )
+    print("[Tumor] postprocess cfg:", cfg_pp)
     print("Using device:", device)
 
     preproc_dir = Path(args.preproc_dir)
@@ -451,15 +398,14 @@ def main():
             vol_roi = torch.from_numpy(in_roi[None, ...]).to(device)
             prob_t = sliding_window_prob(vol_roi, tumor_model, patch_size, stride, num_classes=2)
             prob_tumor = prob_t[1].detach().cpu().numpy().astype(np.float32)
-            tumor_roi = (prob_tumor > float(args.thr)).astype(np.uint8)
 
-            # restrict to liver, remove small cc
-            liver_roi = liver_pred[z0:z1+1, y0:y1+1, x0:x1+1].astype(np.uint8)
-            tumor_roi = (tumor_roi * liver_roi).astype(np.uint8)
-            tumor_roi = remove_small_cc(tumor_roi, min_size=int(args.min_cc))
+            # paste ROI prob back to full volume
+            prob_full = np.zeros_like(tumor_gt, dtype=np.float32)
+            prob_full[z0:z1+1, y0:y1+1, x0:x1+1] = prob_tumor
 
-            tumor_pred = np.zeros_like(tumor_gt, dtype=np.uint8)
-            tumor_pred[z0:z1+1, y0:y1+1, x0:x1+1] = tumor_roi
+            # postprocess on full volume (restricted to liver_pred internally)
+            tumor_pred = postprocess_tumor_prob(prob_full, liver_pred.astype(np.uint8), cfg_pp).astype(np.uint8)
+
 
         d = dice_score(tumor_pred, tumor_gt)
         dices.append(d)

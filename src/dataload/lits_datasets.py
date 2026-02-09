@@ -120,6 +120,8 @@ class LITSDatasetB2ND(Dataset):
         tumor_use_pred_liver: bool = False,
         tumor_pred_liver_dir: Optional[str] = None,
         tumor_pred_bbox_ratio: float = 1.0,
+        tumor_pred_bbox_from: str = "mask",  # mask|prob|union
+        tumor_pred_prob_thr: float = 0.10,
         tumor_add_liver_prior: bool = False,
         tumor_prior_type: str = "mask",  # mask|prob
         tumor_bbox_margin: int = 24,
@@ -129,7 +131,6 @@ class LITSDatasetB2ND(Dataset):
         self.preproc_dir = Path(preproc_dir)
         self.stage = stage
         assert stage in ["liver", "tumor"]
-        self.train = bool(train)
         self.patch_size = tuple(patch_size)
         self.return_sdf = bool(return_sdf) and (stage == "liver")
         self.sdf_clip = float(sdf_clip)
@@ -146,6 +147,8 @@ class LITSDatasetB2ND(Dataset):
         self.tumor_use_pred_liver = bool(tumor_use_pred_liver) and (stage == "tumor")
         self.tumor_pred_liver_dir = Path(tumor_pred_liver_dir) if tumor_pred_liver_dir else None
         self.tumor_pred_bbox_ratio = float(tumor_pred_bbox_ratio)
+        self.tumor_pred_bbox_from = str(tumor_pred_bbox_from)
+        self.tumor_pred_prob_thr = float(tumor_pred_prob_thr)
         self.tumor_add_liver_prior = bool(tumor_add_liver_prior) and (stage == "tumor")
         self.tumor_prior_type = str(tumor_prior_type)
         self.tumor_bbox_margin = int(tumor_bbox_margin)
@@ -170,7 +173,7 @@ class LITSDatasetB2ND(Dataset):
             if self.liver_add_pred_prior:
                 msg += ", liver_add_pred_prior=True"
         else:
-            msg += f", tumor_use_pred_liver={self.tumor_use_pred_liver}, tumor_pred_bbox_ratio={self.tumor_pred_bbox_ratio:.2f}"
+            msg += f", tumor_use_pred_liver={self.tumor_use_pred_liver}, tumor_pred_bbox_ratio={self.tumor_pred_bbox_ratio:.2f}, tumor_pred_bbox_from={self.tumor_pred_bbox_from}, tumor_pred_prob_thr={self.tumor_pred_prob_thr:.2f}"
             if self.tumor_add_liver_prior:
                 msg += f", tumor_prior={self.tumor_prior_type}"
         print(msg)
@@ -179,7 +182,6 @@ class LITSDatasetB2ND(Dataset):
         return len(self.case_ids)
 
     def _load_case_np(self, case_id: str):
-        blosc2.set_nthreads(1)
         dparams = {"nthreads": 1}
         data_file = self.preproc_dir / f"{case_id}.b2nd"
         seg_file = self.preproc_dir / f"{case_id}_seg.b2nd"
@@ -248,35 +250,6 @@ class LITSDatasetB2ND(Dataset):
             sdf = np.clip(sdf, -clip, clip) / clip
         return sdf
 
-    # --------- light data augmentation (no extra deps) ---------
-    def _augment_patch(self, img_czyx: np.ndarray, seg_zyx: np.ndarray, strong: bool = False):
-        """Augment a cropped patch (numpy).
-
-        - flips: always enabled
-        - intensity/noise: only when strong=True (recommended for tumor)
-        """
-        # random flips on spatial axes (Z,Y,X)
-        if np.random.rand() < 0.5:
-            img_czyx = img_czyx[:, ::-1, :, :]
-            seg_zyx = seg_zyx[::-1, :, :]
-        if np.random.rand() < 0.5:
-            img_czyx = img_czyx[:, :, ::-1, :]
-            seg_zyx = seg_zyx[:, ::-1, :]
-        if np.random.rand() < 0.5:
-            img_czyx = img_czyx[:, :, :, ::-1]
-            seg_zyx = seg_zyx[:, :, ::-1]
-
-        if strong:
-            # mild scale/shift (assumes input already normalized by preprocessing)
-            scale = np.random.uniform(0.9, 1.1)
-            shift = np.random.uniform(-0.1, 0.1)
-            img_czyx = img_czyx * scale + shift
-            # gaussian noise
-            if np.random.rand() < 0.5:
-                img_czyx = img_czyx + np.random.normal(0.0, 0.03, size=img_czyx.shape).astype(np.float32)
-
-        return img_czyx, seg_zyx
-
     def _random_crop_in_bbox(self, img: np.ndarray, seg: np.ndarray, bbox: Tuple[int, int, int, int, int, int]):
         """Random crop fully inside bbox (or best-effort if bbox smaller)."""
         _, Z, Y, X = img.shape
@@ -299,7 +272,6 @@ class LITSDatasetB2ND(Dataset):
         return img[:, z0:z0+pz, y0:y0+py, x0:x0+px], seg[z0:z0+pz, y0:y0+py, x0:x0+px]
 
     def __getitem__(self, idx: int):
-        blosc2.set_nthreads(1)  # make sure each worker uses single-thread blosc
         case_id = self.case_ids[idx]
         img, seg = self._load_case_np(case_id)
 
@@ -330,6 +302,8 @@ class LITSDatasetB2ND(Dataset):
             else:
                 img_p, seg_p, start = self._random_crop_full(img, seg)
 
+            target = (seg_p > 0).astype(np.int64)
+
             # optional: append pred prior channel (mask)
             if self.liver_add_pred_prior:
                 if pred_liver is None:
@@ -343,12 +317,6 @@ class LITSDatasetB2ND(Dataset):
                 pz, py, px = self.patch_size
                 prior_p = prior[z0:z0+pz, y0:y0+py, x0:x0+px].astype(np.float32)[None, ...]
                 img_p = np.concatenate([img_p, prior_p], axis=0)
-
-            # augment (train only). liver: flips only
-            if self.train:
-                img_p, seg_p = self._augment_patch(img_p, seg_p, strong=False)
-
-            target = (seg_p > 0).astype(np.int64)
 
             if self.return_sdf:
                 sdf = self._compute_sdf(target.astype(np.uint8), clip=self.sdf_clip)
@@ -371,7 +339,24 @@ class LITSDatasetB2ND(Dataset):
             if np.random.rand() < np.clip(self.tumor_pred_bbox_ratio, 0.0, 1.0):
                 use_pred_bbox = True
 
-        bbox_mask = pred_liver if use_pred_bbox else gt_liver
+        bbox_mask = gt_liver
+        if use_pred_bbox and pred_liver is not None:
+            src = self.tumor_pred_bbox_from.lower().strip()
+            if src not in ["mask", "prob", "union"]:
+                src = "mask"
+            if src == "mask":
+                bbox_mask = pred_liver
+            else:
+                pred_prob = self._load_pred_liver_prob(case_id)
+                if pred_prob is None or pred_prob.shape != gt_liver.shape:
+                    bbox_mask = pred_liver  # fallback
+                else:
+                    prob_mask = (pred_prob >= float(self.tumor_pred_prob_thr)).astype(np.uint8)
+                    if src == "prob":
+                        bbox_mask = prob_mask
+                    else:  # union
+                        bbox_mask = ((pred_liver > 0) | (prob_mask > 0)).astype(np.uint8)
+        
         b = _bbox_from_mask(bbox_mask, margin=self.tumor_bbox_margin)
         if b is None:
             # fallback: full volume bbox
@@ -431,6 +416,9 @@ class LITSDatasetB2ND(Dataset):
         else:
             img_p, seg_p = self._crop_by_start(img, seg, start)
 
+        # tumor label: 2 -> 1, else 0
+        target = (seg_p == 2).astype(np.int64)
+
         # optional: append liver prior channel
         if self.tumor_add_liver_prior:
             prior = None
@@ -448,13 +436,6 @@ class LITSDatasetB2ND(Dataset):
             zz, yy, xx = start
             prior_p = prior[zz:zz+pz, yy:yy+py, xx:xx+px][None, ...].astype(np.float32)
             img_p = np.concatenate([img_p, prior_p], axis=0)
-
-        # augment (train only). tumor: flips + mild intensity/noise
-        if self.train:
-            img_p, seg_p = self._augment_patch(img_p, seg_p, strong=True)
-
-        # tumor label: 2 -> 1, else 0
-        target = (seg_p == 2).astype(np.int64)
 
         sdf = np.zeros((1,) + self.patch_size, dtype=np.float32)
         return (

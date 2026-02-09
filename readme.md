@@ -107,9 +107,6 @@ python train.py \
   --liver_pred_dir train_logs/liver_coarse/pred_liver \
   --resume train_logs/liver_refine/liver_last.pth
 
-
-
-
 # tumor之前使用自训网络进行liver裁剪
 python infer.py \
   --preproc_dir $PREPROC_DIR \
@@ -119,28 +116,30 @@ python infer.py \
   --bbox_margin 24 \
   --save_prob
 
-
-
 # tumor 
 python train.py \
   --preproc_dir $PREPROC_DIR \
   --stage tumor \
-  --save_dir train_logs/tumor_cbam_ds \
+  --save_dir train_logs/lits_tumor_attn \ 
   --epochs 1000 \
   --batch_size 2 \
   --lr 1e-3 \
   --num_workers 4 \
   --patch_size 96 160 160 \
+  --train_ratio 0.8 \
+  --seed 0 \
   --tumor_use_pred_liver 1 \
   --tumor_pred_liver_dir train_logs/pred_liver_for_tumor \
-  --tumor_pred_bbox_ratio 0.5 \
+  --tumor_pred_bbox_ratio 0.7 \
+  --tumor_pred_bbox_from union \
+  --tumor_pred_prob_thr 0.10 \
   --tumor_add_liver_prior 1 \
   --tumor_prior_type prob \
-  --use_attn_gate 1 \
-  --use_cbam 1 \
-  --deep_supervision 1 \
-  --amp 1 \
-  --base_filters 32
+  --tumor_bbox_margin 24 \
+  --tumor_pos_ratio 0.6 \
+  --tumor_hardneg_ratio 0.3 \
+  --resume train_logs/lits_tumor_attn/tumor_last.pth
+
 
 
 ```
@@ -202,6 +201,37 @@ python eval_tumor_full.py \
   --bbox_margin 24 \
   --thr 0.5 \
   --min_cc 5
+
+# 先在 LiTS 上跑 tumor prob
+python infer_tumor_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --out_dir train_logs/tumor_val_prob \
+  --ckpt_tumor train_logs/lits_tumor_attn/tumor_best.pth \
+  --liver_dir train_logs/pred_liver_for_tumor \
+  --patch_size 96 160 160 --stride 48 80 80 \
+  --bbox_margin 24 \
+  --liver_bbox_from union --liver_prob_thr 0.10 \
+  --tumor_prior_type prob \
+  --save_prob
+
+# 在 val 上自动搜索后处理参数
+python tune_tumor_postprocess.py \
+  --preproc_dir $PREPROC_DIR \
+  --prob_dir train_logs/tumor_val_prob \
+  --liver_dir train_logs/pred_liver_for_tumor \
+  --split val --train_ratio 0.8 --seed 0 \
+  --metric weighted --alpha 0.7 \
+  --out_json best_tumor_postprocess.json
+
+# 用该 json 在 LiTS val 上评估
+python eval_tumor_full.py \
+  --preproc_dir $PREPROC_DIR \
+  --ckpt_tumor train_logs/lits_tumor_attn/tumor_best.pth \
+  --liver_dir train_logs/pred_liver_for_tumor \
+  --split val --train_ratio 0.8 --seed 0 \
+  --patch_size 96 160 160 --stride 48 80 80 \
+  --bbox_margin 24 \
+  --postprocess_json train_logs/tumor_val_prob/best_tumor_postprocess.json
 
 # GT数据测上限
 python eval_tumor_full.py \
