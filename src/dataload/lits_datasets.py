@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional
 
 import blosc2
 import numpy as np
@@ -61,7 +61,6 @@ def _pad_end_vol(vol_zyx: np.ndarray, patch_size: Tuple[int, int, int]) -> np.nd
 
 
 def _randint(lo: int, hi: int) -> int:
-    # inclusive bounds
     if hi <= lo:
         return int(lo)
     return int(np.random.randint(lo, hi + 1))
@@ -87,7 +86,7 @@ class LITSDatasetB2ND(Dataset):
     nnUNetv2 预处理后的 LiTS (.b2nd + .pkl)
 
     - liver:
-        * liver_use_bbox=0: 全体积随机裁剪
+        * liver_use_bbox=0: 全体积随机裁剪（加入 pos/hardneg mix，抑制FP）
         * liver_use_bbox=1: 在 bbox(来自 GT 或 pred) 内随机裁剪
         * return_sdf=True: 额外返回 liver mask 的 SDF（用于 sdf head）
 
@@ -116,6 +115,16 @@ class LITSDatasetB2ND(Dataset):
         liver_pred_dir: Optional[str] = None,
         liver_add_pred_prior: bool = False,
 
+        # liver coarse sampling params
+        liver_pos_ratio: float = 0.5,
+        liver_hardneg_ratio: float = 0.4,
+        liver_min_pos_vox: int = 64,
+        liver_pos_retries: int = 16,
+        liver_hardneg_retries: int = 32,
+        liver_body_minfrac: float = 0.15,
+        liver_air_value: float = -3.0825,
+        liver_air_eps: float = 0.02,
+
         # tumor
         tumor_use_pred_liver: bool = False,
         tumor_pred_liver_dir: Optional[str] = None,
@@ -127,12 +136,18 @@ class LITSDatasetB2ND(Dataset):
         tumor_bbox_margin: int = 24,
         tumor_pos_ratio: float = 0.6,
         tumor_hardneg_ratio: float = 0.3,
+        tumor_min_pos_vox: int = 1,
+        tumor_pos_retries: int = 12,
+        tumor_hardneg_lowfrac: float = 0.0,
+        tumor_hardneg_lowq: float = 10.0,
     ):
         self.preproc_dir = Path(preproc_dir)
         self.stage = stage
         assert stage in ["liver", "tumor"]
         self.patch_size = tuple(patch_size)
-        self.return_sdf = bool(return_sdf) and (stage == "liver")
+        self.train = bool(train)
+
+        self.return_sdf = bool(return_sdf)
         self.sdf_clip = float(sdf_clip)
         self.sdf_margin = int(sdf_margin)
 
@@ -142,6 +157,16 @@ class LITSDatasetB2ND(Dataset):
         self.liver_use_pred_bbox = bool(liver_use_pred_bbox) and (stage == "liver")
         self.liver_pred_dir = Path(liver_pred_dir) if liver_pred_dir else None
         self.liver_add_pred_prior = bool(liver_add_pred_prior) and (stage == "liver")
+
+        # liver coarse sampling options
+        self.liver_pos_ratio = float(liver_pos_ratio)
+        self.liver_hardneg_ratio = float(liver_hardneg_ratio)
+        self.liver_min_pos_vox = int(liver_min_pos_vox)
+        self.liver_pos_retries = int(liver_pos_retries)
+        self.liver_hardneg_retries = int(liver_hardneg_retries)
+        self.liver_body_minfrac = float(liver_body_minfrac)
+        self.liver_air_value = float(liver_air_value)
+        self.liver_air_eps = float(liver_air_eps)
 
         # tumor options
         self.tumor_use_pred_liver = bool(tumor_use_pred_liver) and (stage == "tumor")
@@ -154,6 +179,10 @@ class LITSDatasetB2ND(Dataset):
         self.tumor_bbox_margin = int(tumor_bbox_margin)
         self.tumor_pos_ratio = float(tumor_pos_ratio)
         self.tumor_hardneg_ratio = float(tumor_hardneg_ratio)
+        self.tumor_min_pos_vox = int(tumor_min_pos_vox)
+        self.tumor_pos_retries = int(tumor_pos_retries)
+        self.tumor_hardneg_lowfrac = float(tumor_hardneg_lowfrac)
+        self.tumor_hardneg_lowq = float(tumor_hardneg_lowq)
 
         all_pkl = sorted(self.preproc_dir.glob("*.pkl"))
         case_ids = [p.stem for p in all_pkl]
@@ -170,10 +199,12 @@ class LITSDatasetB2ND(Dataset):
         msg = f"[LITSDatasetB2ND] stage={stage}, train={train}, num_cases={len(self.case_ids)}, patch_size={self.patch_size}"
         if stage == "liver":
             msg += f", liver_use_bbox={self.liver_use_bbox}, liver_use_pred_bbox={self.liver_use_pred_bbox}, return_sdf={self.return_sdf}"
+            if not self.liver_use_bbox:
+                msg += f", liver_pos_ratio={self.liver_pos_ratio:.2f}, liver_hardneg_ratio={self.liver_hardneg_ratio:.2f}, body_minfrac={self.liver_body_minfrac:.2f}"
             if self.liver_add_pred_prior:
                 msg += ", liver_add_pred_prior=True"
         else:
-            msg += f", tumor_use_pred_liver={self.tumor_use_pred_liver}, tumor_pred_bbox_ratio={self.tumor_pred_bbox_ratio:.2f}, tumor_pred_bbox_from={self.tumor_pred_bbox_from}, tumor_pred_prob_thr={self.tumor_pred_prob_thr:.2f}"
+            msg += f", tumor_use_pred_liver={self.tumor_use_pred_liver}, tumor_pred_bbox_ratio={self.tumor_pred_bbox_ratio:.2f}, tumor_pred_bbox_from={self.tumor_pred_bbox_from}, tumor_pred_prob_thr={self.tumor_pred_prob_thr:.2f}, tumor_min_pos_vox={self.tumor_min_pos_vox}, tumor_lowfrac={self.tumor_hardneg_lowfrac:.2f}"
             if self.tumor_add_liver_prior:
                 msg += f", tumor_prior={self.tumor_prior_type}"
         print(msg)
@@ -201,7 +232,6 @@ class LITSDatasetB2ND(Dataset):
         return img, seg
 
     def _load_pred_liver(self, case_id: str) -> Optional[np.ndarray]:
-        """Load pred liver mask (Z,Y,X) 0/1 if exists."""
         if not self.liver_pred_dir and not self.tumor_pred_liver_dir:
             return None
         dirs = []
@@ -217,7 +247,6 @@ class LITSDatasetB2ND(Dataset):
                 m = (m > 0).astype(np.uint8)
                 m = _pad_end_vol(m, self.patch_size)
                 return m
-            # fallback names (older scripts)
             p2 = d / f"{case_id}_liver_pred.npy"
             if p2.is_file():
                 m = np.load(p2)
@@ -227,7 +256,6 @@ class LITSDatasetB2ND(Dataset):
         return None
 
     def _load_pred_liver_prob(self, case_id: str) -> Optional[np.ndarray]:
-        """Load pred liver prob (Z,Y,X) float if exists."""
         if self.stage != "tumor" or (not self.tumor_pred_liver_dir):
             return None
         d = self.tumor_pred_liver_dir
@@ -243,15 +271,23 @@ class LITSDatasetB2ND(Dataset):
     def _compute_sdf(binary_mask_zyx: np.ndarray, clip: float = 20.0) -> np.ndarray:
         """Signed distance field in [-1,1] (after clip & normalize)."""
         mask = (binary_mask_zyx > 0).astype(np.uint8)
+
+        if mask.sum() == 0:
+            return np.ones_like(mask, dtype=np.float32)
+        if mask.sum() == mask.size:
+            return -np.ones_like(mask, dtype=np.float32)
+
         itk = sitk.GetImageFromArray(mask)
-        dist_out = sitk.SignedMaurerDistanceMap(itk, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
-        sdf = sitk.GetArrayFromImage(dist_out).astype(np.float32)
-        if clip > 0:
-            sdf = np.clip(sdf, -clip, clip) / clip
+        dist = sitk.SignedMaurerDistanceMap(itk, insideIsPositive=False, squaredDistance=False, useImageSpacing=True)
+        sdf = sitk.GetArrayFromImage(dist).astype(np.float32)
+
+        if clip and clip > 0:
+            sdf = np.clip(sdf, -clip, clip) / float(clip)
+
+        sdf = np.nan_to_num(sdf, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
         return sdf
 
     def _random_crop_in_bbox(self, img: np.ndarray, seg: np.ndarray, bbox: Tuple[int, int, int, int, int, int]):
-        """Random crop fully inside bbox (or best-effort if bbox smaller)."""
         _, Z, Y, X = img.shape
         pz, py, px = self.patch_size
         z0, z1, y0, y1, x0, x1 = _clamp_bbox(bbox, Z, Y, X)
@@ -271,20 +307,25 @@ class LITSDatasetB2ND(Dataset):
         z0, y0, x0 = start_zyx
         return img[:, z0:z0+pz, y0:y0+py, x0:x0+px], seg[z0:z0+pz, y0:y0+py, x0:x0+px]
 
+    def _random_crop_full(self, img: np.ndarray, seg: np.ndarray):
+        _, Z, Y, X = img.shape
+        pz, py, px = self.patch_size
+        sz = int(np.random.randint(0, max(Z - pz + 1, 1)))
+        sy = int(np.random.randint(0, max(Y - py + 1, 1)))
+        sx = int(np.random.randint(0, max(X - px + 1, 1)))
+        return img[:, sz:sz+pz, sy:sy+py, sx:sx+px], seg[sz:sz+pz, sy:sy+py, sx:sx+px], (sz, sy, sx)
+
     def __getitem__(self, idx: int):
         case_id = self.case_ids[idx]
         img, seg = self._load_case_np(case_id)
 
-        # pad end so sliding/cropping never produces smaller-than-patch blocks
         img, seg = _pad_end_img_seg(img, seg, self.patch_size)
 
-        # --------- build GT masks ---------
         gt_liver = (seg > 0).astype(np.uint8)
         gt_tumor = (seg == 2).astype(np.uint8)
 
         # --------- liver stage ---------
         if self.stage == "liver":
-            # bbox source: GT or pred
             bbox_mask = gt_liver
             pred_liver = None
             if self.liver_use_bbox and self.liver_use_pred_bbox:
@@ -295,16 +336,91 @@ class LITSDatasetB2ND(Dataset):
             if self.liver_use_bbox:
                 b = _bbox_from_mask(bbox_mask, margin=self.liver_bbox_margin)
                 if b is None:
-                    # fallback: full-volume crop
                     img_p, seg_p, start = self._random_crop_full(img, seg)
                 else:
                     img_p, seg_p, start = self._random_crop_in_bbox(img, seg, b)
             else:
-                img_p, seg_p, start = self._random_crop_full(img, seg)
+                # coarse: pos / hardneg / random mix (train only)
+                if not self.train:
+                    img_p, seg_p, start = self._random_crop_full(img, seg)
+                else:
+                    pz, py, px = self.patch_size
+                    _, Z, Y, X = img.shape
+
+                    pos_r = max(0.0, self.liver_pos_ratio)
+                    hn_r = max(0.0, self.liver_hardneg_ratio)
+                    if pos_r + hn_r > 1.0:
+                        s = pos_r + hn_r
+                        pos_r /= s
+                        hn_r /= s
+
+                    r = float(np.random.rand())
+                    mode = "random"
+                    if r < pos_r:
+                        mode = "pos"
+                    elif r < pos_r + hn_r:
+                        mode = "hardneg"
+
+                    body_thr = float(self.liver_air_value + self.liver_air_eps)
+                    body = (img[0] > body_thr)
+
+                    def body_frac(z0, y0, x0):
+                        m = body[z0:z0+pz, y0:y0+py, x0:x0+px]
+                        return float(m.mean())
+
+                    def pick_start_for_center(cz, cy, cx):
+                        rz = _start_range_for_center(int(cz), pz, 0, Z - 1, Z)
+                        ry = _start_range_for_center(int(cy), py, 0, Y - 1, Y)
+                        rx = _start_range_for_center(int(cx), px, 0, X - 1, X)
+                        if (rz is None) or (ry is None) or (rx is None):
+                            return None
+                        return (_randint(rz[0], rz[1]), _randint(ry[0], ry[1]), _randint(rx[0], rx[1]))
+
+                    start = None
+
+                    # positive: require enough liver voxels
+                    if mode == "pos":
+                        cand = np.where(gt_liver)
+                        if cand[0].size > 0:
+                            for _ in range(max(1, self.liver_pos_retries)):
+                                k = int(np.random.randint(0, cand[0].size))
+                                cz, cy, cx = int(cand[0][k]), int(cand[1][k]), int(cand[2][k])
+                                st = pick_start_for_center(cz, cy, cx)
+                                if st is None:
+                                    continue
+                                _img_p, _seg_p = self._crop_by_start(img, seg, st)
+                                if int((_seg_p > 0).sum()) < int(self.liver_min_pos_vox):
+                                    continue
+                                if float(self.liver_body_minfrac) > 0 and body_frac(*st) < float(self.liver_body_minfrac):
+                                    continue
+                                start = st
+                                break
+
+                    # hardneg: body but non-liver, require liver voxels == 0
+                    if start is None and mode == "hardneg":
+                        cand = np.where(body & (~gt_liver.astype(bool)))
+                        if cand[0].size > 0:
+                            for _ in range(max(1, self.liver_hardneg_retries)):
+                                k = int(np.random.randint(0, cand[0].size))
+                                cz, cy, cx = int(cand[0][k]), int(cand[1][k]), int(cand[2][k])
+                                st = pick_start_for_center(cz, cy, cx)
+                                if st is None:
+                                    continue
+                                _img_p, _seg_p = self._crop_by_start(img, seg, st)
+                                if int((_seg_p > 0).sum()) != 0:
+                                    continue
+                                if float(self.liver_body_minfrac) > 0 and body_frac(*st) < float(self.liver_body_minfrac):
+                                    continue
+                                start = st
+                                break
+
+                    if start is None:
+                        img_p, seg_p, start = self._random_crop_full(img, seg)
+                    else:
+                        img_p, seg_p = self._crop_by_start(img, seg, start)
 
             target = (seg_p > 0).astype(np.int64)
 
-            # optional: append pred prior channel (mask)
             if self.liver_add_pred_prior:
                 if pred_liver is None:
                     pred_liver = self._load_pred_liver(case_id)
@@ -332,7 +448,6 @@ class LITSDatasetB2ND(Dataset):
             )
 
         # --------- tumor stage ---------
-        # bbox source mixing: pred or GT
         pred_liver = self._load_pred_liver(case_id) if self.tumor_use_pred_liver else None
         use_pred_bbox = False
         if self.tumor_use_pred_liver and pred_liver is not None and pred_liver.shape == gt_liver.shape:
@@ -349,23 +464,21 @@ class LITSDatasetB2ND(Dataset):
             else:
                 pred_prob = self._load_pred_liver_prob(case_id)
                 if pred_prob is None or pred_prob.shape != gt_liver.shape:
-                    bbox_mask = pred_liver  # fallback
+                    bbox_mask = pred_liver
                 else:
                     prob_mask = (pred_prob >= float(self.tumor_pred_prob_thr)).astype(np.uint8)
                     if src == "prob":
                         bbox_mask = prob_mask
-                    else:  # union
+                    else:
                         bbox_mask = ((pred_liver > 0) | (prob_mask > 0)).astype(np.uint8)
-        
+
         b = _bbox_from_mask(bbox_mask, margin=self.tumor_bbox_margin)
         if b is None:
-            # fallback: full volume bbox
             _, Z, Y, X = img.shape
             b = (0, Z - 1, 0, Y - 1, 0, X - 1)
         b = _clamp_bbox(b, img.shape[1], img.shape[2], img.shape[3])
         z0, z1, y0, y1, x0, x1 = b
 
-        # candidates in bbox
         roi_seg = seg[z0:z1+1, y0:y1+1, x0:x1+1]
         roi_liver = (roi_seg > 0)
         roi_tumor = (roi_seg == 2)
@@ -399,27 +512,42 @@ class LITSDatasetB2ND(Dataset):
         if mode == "pos":
             cand = np.where(roi_tumor)
             if cand[0].size > 0:
-                k = int(np.random.randint(0, cand[0].size))
-                cz, cy, cx = int(cand[0][k] + z0), int(cand[1][k] + y0), int(cand[2][k] + x0)
-                start = pick_start_for_center(cz, cy, cx)
+                for _ in range(max(1, self.tumor_pos_retries)):
+                    k = int(np.random.randint(0, cand[0].size))
+                    cz, cy, cx = int(cand[0][k] + z0), int(cand[1][k] + y0), int(cand[2][k] + x0)
+                    st = pick_start_for_center(cz, cy, cx)
+                    if st is None:
+                        continue
+                    _img_p, _seg_p = self._crop_by_start(img, seg, st)
+                    if int((_seg_p == 2).sum()) >= int(self.tumor_min_pos_vox):
+                        start = st
+                        break
 
         if start is None and mode == "hardneg":
-            cand = np.where(roi_liver & (~roi_tumor))
+            roi_img0 = img[0, z0:z1+1, y0:y1+1, x0:x1+1]
+            mask_hn = roi_liver & (~roi_tumor)
+
+            if self.tumor_hardneg_lowfrac > 0 and np.random.rand() < self.tumor_hardneg_lowfrac:
+                vals = roi_img0[roi_liver]
+                if vals.size > 0:
+                    thr = np.percentile(vals, float(self.tumor_hardneg_lowq))
+                    mask_low = mask_hn & (roi_img0 <= thr)
+                    if mask_low.any():
+                        mask_hn = mask_low
+
+            cand = np.where(mask_hn)
             if cand[0].size > 0:
                 k = int(np.random.randint(0, cand[0].size))
                 cz, cy, cx = int(cand[0][k] + z0), int(cand[1][k] + y0), int(cand[2][k] + x0)
                 start = pick_start_for_center(cz, cy, cx)
 
         if start is None:
-            # random crop inside bbox
             img_p, seg_p, start = self._random_crop_in_bbox(img, seg, b)
         else:
             img_p, seg_p = self._crop_by_start(img, seg, start)
 
-        # tumor label: 2 -> 1, else 0
         target = (seg_p == 2).astype(np.int64)
 
-        # optional: append liver prior channel
         if self.tumor_add_liver_prior:
             prior = None
             if self.tumor_prior_type == "prob":
@@ -437,19 +565,15 @@ class LITSDatasetB2ND(Dataset):
             prior_p = prior[zz:zz+pz, yy:yy+py, xx:xx+px][None, ...].astype(np.float32)
             img_p = np.concatenate([img_p, prior_p], axis=0)
 
-        sdf = np.zeros((1,) + self.patch_size, dtype=np.float32)
+        if self.return_sdf:
+            sdf = self._compute_sdf(target.astype(np.uint8), clip=self.sdf_clip)
+            sdf = sdf[None, ...].astype(np.float32)
+        else:
+            sdf = np.zeros((1,) + self.patch_size, dtype=np.float32)
+
         return (
             torch.from_numpy(img_p.copy()),
             torch.from_numpy(target.copy()),
             torch.from_numpy(sdf.copy()),
             case_id,
         )
-
-    def _random_crop_full(self, img: np.ndarray, seg: np.ndarray):
-        """Random crop anywhere in volume (after pad_end)."""
-        _, Z, Y, X = img.shape
-        pz, py, px = self.patch_size
-        sz = int(np.random.randint(0, max(Z - pz + 1, 1)))
-        sy = int(np.random.randint(0, max(Y - py + 1, 1)))
-        sx = int(np.random.randint(0, max(X - px + 1, 1)))
-        return img[:, sz:sz+pz, sy:sy+py, sx:sx+px], seg[sz:sz+pz, sy:sy+py, sx:sx+px], (sz, sy, sx)

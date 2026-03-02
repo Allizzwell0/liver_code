@@ -204,6 +204,10 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     num_classes = int(ckpt.get("num_classes", 2))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+    backbone = str(ckpt.get("backbone", "unet")).lower()
+    mednext_k = int(ckpt.get("mednext_k", 7))
+    mednext_expansion = int(ckpt.get("mednext_expansion", 4))
+    mednext_blocks = int(ckpt.get("mednext_blocks", 2))
     model = UNet3D(
         in_channels=in_channels,
         num_classes=num_classes,
@@ -211,6 +215,10 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
         dropout_p=float(ckpt.get("dropout_p", 0.0)),
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
+        backbone=backbone,
+        mednext_k=mednext_k,
+        mednext_expansion=mednext_expansion,
+        mednext_blocks=mednext_blocks,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
@@ -244,6 +252,12 @@ def parse_args():
     p.add_argument("--stride", type=int, nargs=3, default=[48, 80, 80])
 
     p.add_argument("--bbox_margin", type=int, default=24)
+
+    # liver bbox source (align with infer_tumor_full.py)
+    p.add_argument("--liver_bbox_from", type=str, default="mask", choices=["mask","prob","union","gt"],
+                   help="bbox mask source: pred mask / liver prob / union / gt")
+    p.add_argument("--liver_prob_thr", type=float, default=0.10)
+    p.add_argument("--case_ids", type=str, default=None, help="comma-separated case ids for debugging")
 
     # postprocess
     p.add_argument("--postprocess_json", type=str, default=None, help="from tune_tumor_postprocess.py")
@@ -329,6 +343,10 @@ def main():
     stride = tuple(args.stride)
 
     case_ids = list_case_ids(preproc_dir, args.split, args.train_ratio, args.seed)
+    if args.case_ids:
+        want = [c.strip() for c in args.case_ids.split(',') if c.strip()]
+        # override split selection for debugging
+        case_ids = [c for c in want]
     if args.max_cases > 0:
         case_ids = case_ids[: args.max_cases]
     print(f"Found {len(case_ids)} case(s) for split='{args.split}'.")
@@ -370,12 +388,21 @@ def main():
             liver_prob = liver_prob.astype(np.float32)
 
         # ---- bbox for tumor ----
-        if args.use_gt_liver_bbox:
-            b = bbox_from_mask(liver_gt, margin=int(args.bbox_margin))
+        # choose bbox mask source
+        if args.use_gt_liver_bbox or (args.liver_bbox_from == "gt"):
+            liver_for_tumor = liver_gt.astype(np.uint8)
         else:
-            b = bbox_from_mask(liver_pred, margin=int(args.bbox_margin))
-            if b is None:
-                b = bbox_from_mask(liver_gt, margin=int(args.bbox_margin))  # fallback
+            liver_for_tumor = liver_pred.astype(np.uint8)
+            if (args.liver_bbox_from in ["prob", "union"]) and (liver_prob is not None):
+                prob_mask = (liver_prob > float(args.liver_prob_thr)).astype(np.uint8)
+                if args.liver_bbox_from == "prob":
+                    liver_for_tumor = prob_mask
+                else:
+                    liver_for_tumor = ((liver_for_tumor > 0) | (prob_mask > 0)).astype(np.uint8)
+
+        b = bbox_from_mask(liver_for_tumor, margin=int(args.bbox_margin))
+        if b is None:
+            b = bbox_from_mask(liver_gt, margin=int(args.bbox_margin))  # fallback
 
         if b is None:
             tumor_pred = np.zeros_like(tumor_gt, dtype=np.uint8)
@@ -392,7 +419,7 @@ def main():
                     prior_full = liver_prob
                     prior_roi = prior_full[z0:z1+1, y0:y1+1, x0:x1+1][None, ...].astype(np.float32)
                 else:
-                    prior_roi = liver_pred[z0:z1+1, y0:y1+1, x0:x1+1][None, ...].astype(np.float32)
+                    prior_roi = liver_for_tumor[z0:z1+1, y0:y1+1, x0:x1+1][None, ...].astype(np.float32)
                 in_roi = np.concatenate([img_roi, prior_roi], axis=0).astype(np.float32)
 
             vol_roi = torch.from_numpy(in_roi[None, ...]).to(device)
@@ -404,7 +431,7 @@ def main():
             prob_full[z0:z1+1, y0:y1+1, x0:x1+1] = prob_tumor
 
             # postprocess on full volume (restricted to liver_pred internally)
-            tumor_pred = postprocess_tumor_prob(prob_full, liver_pred.astype(np.uint8), cfg_pp).astype(np.uint8)
+            tumor_pred = postprocess_tumor_prob(prob_full, liver_for_tumor.astype(np.uint8), cfg_pp).astype(np.uint8)
 
 
         d = dice_score(tumor_pred, tumor_gt)

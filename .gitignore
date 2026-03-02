@@ -8,3 +8,4 @@ src/train_logs/
 __pycache__/
 eval_liver_full_val/
 src/eval_liver_full_val/
+eval_tumor_full/

@@ -35,6 +35,10 @@ def parse_args():
     p.add_argument("--stride", type=int, nargs=3, default=[64, 64, 64])
     p.add_argument("--bbox_margin", type=int, default=24)
     p.add_argument("--thr", type=float, default=0.5)
+    # bbox seed for cascade (avoid full-body bbox on OOD cases)
+    p.add_argument("--thr_bbox", type=float, default=0.98, help="seed threshold for bbox (use high) (default 0.98)")
+    p.add_argument("--bbox_area_frac", type=float, default=0.03, help="keep z-slices with seed area >= max_area*frac (default 0.03)")
+    p.add_argument("--bbox_min_area", type=int, default=500, help="min seed area per slice to be considered (default 500)")
     p.add_argument("--save_prob", action="store_true", help="保存 prob_liver.npy（float32）")
     return p.parse_args()
 
@@ -96,6 +100,59 @@ def bbox_from_mask(mask: np.ndarray, margin: int, shape_zyx: Tuple[int, int, int
     y0 = max(0, min(y0, Y - 1)); y1 = max(0, min(y1, Y - 1))
     x0 = max(0, min(x0, X - 1)); x1 = max(0, min(x1, X - 1))
     return z0, z1, y0, y1, x0, x1
+
+def bbox_from_prob_seed(prob_zyx: np.ndarray,
+                        thr_seed: float,
+                        margin: int,
+                        area_frac: float,
+                        min_area: int) -> Optional[Tuple[int, int, int, int, int, int]]:
+    """
+    Build a stable bbox from a HIGH-threshold seed.
+    1) seed = prob > thr_seed
+    2) slice-area gating: keep z slices where area >= max_area*area_frac and area >= min_area
+    3) keep largest contiguous z-segment
+    4) keep largest CC within that z-segment, then bbox_from_mask(+margin)
+    """
+    seed = (prob_zyx > float(thr_seed)).astype(np.uint8)
+    if int(seed.sum()) == 0:
+        return None
+
+    area = seed.sum(axis=(1, 2)).astype(np.int64)  # per-z
+    mx = int(area.max())
+    thr_area = max(int(mx * float(area_frac)), int(min_area))
+    keep_z = (area >= thr_area)
+
+    # if too strict, relax to any non-zero area
+    if keep_z.sum() == 0:
+        keep_z = (area > 0)
+        if keep_z.sum() == 0:
+            return None
+
+    # largest contiguous segment in z
+    idx = np.where(keep_z)[0]
+    segments = []
+    st = int(idx[0]); prev = int(idx[0])
+    for z in idx[1:]:
+        z = int(z)
+        if z == prev + 1:
+            prev = z
+        else:
+            segments.append((st, prev))
+            st = z; prev = z
+    segments.append((st, prev))
+    # pick segment with max total area
+    best = max(segments, key=lambda ab: int(area[ab[0]:ab[1]+1].sum()))
+    z0, z1 = best
+
+    # restrict seed to this z-segment only
+    seed2 = np.zeros_like(seed, dtype=np.uint8)
+    seed2[z0:z1+1] = seed[z0:z1+1]
+
+    # within segment, keep largest CC to avoid scattered noise
+    seed2 = keep_largest_cc(seed2)
+    seed2 = fill_holes(seed2)
+
+    return bbox_from_mask(seed2, margin=int(margin), shape_zyx=seed2.shape)
 
 
 def pad_to_min(volume: torch.Tensor, patch: Tuple[int, int, int]) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
@@ -177,6 +234,10 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     num_classes = int(ckpt.get("num_classes", 2))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+    backbone = str(ckpt.get("backbone", "unet")).lower()
+    mednext_k = int(ckpt.get("mednext_k", 7))
+    mednext_expansion = int(ckpt.get("mednext_expansion", 4))
+    mednext_blocks = int(ckpt.get("mednext_blocks", 2))
 
     model = UNet3D(
         in_channels=in_channels,
@@ -185,10 +246,32 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
         dropout_p=0.0,
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
+        backbone=backbone,
+        mednext_k=mednext_k,
+        mednext_expansion=mednext_expansion,
+        mednext_blocks=mednext_blocks,
     ).to(device)
-    model.load_state_dict(ckpt["model_state"], strict=True)
+    # --- robust state_dict loading (handle net./module. prefix mismatch) ---
+    sd = ckpt["model_state"]
+    # strip DDP prefix
+    if any(k.startswith("module.") for k in sd.keys()):
+        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+
+    model_keys = list(model.state_dict().keys())
+    model_has_net = any(k.startswith("net.") for k in model_keys)
+    sd_has_net = any(k.startswith("net.") for k in sd.keys())
+
+    if model_has_net and (not sd_has_net):
+        # ckpt: enc0.xxx  -> model: net.enc0.xxx
+        sd = {("net." + k): v for k, v in sd.items()}
+    elif (not model_has_net) and sd_has_net:
+        # ckpt: net.enc0.xxx -> model: enc0.xxx
+        sd = {k.replace("net.", "", 1): v for k, v in sd.items()}
+
+    model.load_state_dict(sd, strict=True)
     model.eval()
-    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head)
+    meta = dict(in_channels=in_channels, num_classes=num_classes, use_coords=use_coords, use_sdf_head=use_sdf_head,
+                backbone=backbone, mednext_k=mednext_k, mednext_expansion=mednext_expansion, mednext_blocks=mednext_blocks)
     return model, meta
 
 
@@ -225,8 +308,19 @@ def main():
         prob_c = sliding_window_prob(vol, model_c, patch_size, stride, num_classes=meta_c["num_classes"])
         prob_liver_c = prob_c[1].detach().cpu().numpy()  # (Z,Y,X)
 
-        liver_c = postprocess_liver((prob_liver_c > args.thr).astype(np.uint8))
-        b = bbox_from_mask(liver_c, margin=int(args.bbox_margin), shape_zyx=liver_c.shape)
+        # --- robust bbox from HIGH-threshold seed + slice-area gating ---
+        b = bbox_from_prob_seed(
+            prob_liver_c,
+            thr_seed=float(args.thr_bbox),
+            margin=int(args.bbox_margin),
+            area_frac=float(args.bbox_area_frac),
+            min_area=int(args.bbox_min_area),
+        )
+        # fallback to old behavior if seed bbox fails
+        if b is None:
+            liver_c = postprocess_liver((prob_liver_c > args.thr).astype(np.uint8))
+            b = bbox_from_mask(liver_c, margin=int(args.bbox_margin), shape_zyx=liver_c.shape)
+        print(f"[BBox] {case_id} bbox={b} thr_bbox={args.thr_bbox} area_frac={args.bbox_area_frac} min_area={args.bbox_min_area}")
 
         if b is None:
             # fallback: no liver found -> output zeros
@@ -247,7 +341,13 @@ def main():
                 prob_liver_full = np.zeros_like(prob_liver_c, dtype=np.float32)
                 prob_liver_full[z0:z1+1, y0:y1+1, x0:x1+1] = prob_liver_r
 
-            pred_liver = postprocess_liver((prob_liver_full > args.thr).astype(np.uint8))
+                raw = (prob_liver_full > args.thr).astype(np.uint8)
+            if b is not None:
+                z0, z1, y0, y1, x0, x1 = b
+                raw2 = np.zeros_like(raw, dtype=np.uint8)
+                raw2[z0:z1+1, y0:y1+1, x0:x1+1] = raw[z0:z1+1, y0:y1+1, x0:x1+1]
+                raw = raw2
+            pred_liver = postprocess_liver(raw)
         np.save(out_dir / f"{case_id}_pred_liver.npy", pred_liver.astype(np.uint8))
         if args.save_prob:
             np.save(out_dir / f"{case_id}_prob_liver.npy", prob_liver_full.astype(np.float32))

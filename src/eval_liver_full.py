@@ -183,6 +183,10 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
     num_classes = int(ckpt.get("num_classes", 2))
     use_coords = bool(ckpt.get("use_coords", False))
     use_sdf_head = bool(ckpt.get("use_sdf_head", False))
+    backbone = str(ckpt.get("backbone", "unet")).lower()
+    mednext_k = int(ckpt.get("mednext_k", 7))
+    mednext_expansion = int(ckpt.get("mednext_expansion", 4))
+    mednext_blocks = int(ckpt.get("mednext_blocks", 2))
 
     model = UNet3D(
         in_channels=in_channels,
@@ -191,6 +195,10 @@ def load_model(ckpt_path: str, device: torch.device) -> Tuple[torch.nn.Module, d
         dropout_p=float(ckpt.get("dropout_p", 0.0)),
         use_coords=use_coords,
         use_sdf_head=use_sdf_head,
+        backbone=backbone,
+        mednext_k=mednext_k,
+        mednext_expansion=mednext_expansion,
+        mednext_blocks=mednext_blocks,
     ).to(device)
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
